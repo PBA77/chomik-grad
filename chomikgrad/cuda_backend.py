@@ -69,9 +69,15 @@ class CUDAProgram(CompiledProgram):
 class CUDACompiler(Compiler):
     """Translate the portable six-operation IR to CuPy on an NVIDIA GPU."""
 
+    _SGD_FUSION_GROUP_SIZE = 16
+
     _SUPPORTED_LOWERINGS = {
+        "elementwise_fusion",
         "layer_norm",
         "layer_norm_backward",
+        "log_softmax",
+        "log_softmax_backward",
+        "softmax",
         "softmax_backward",
     }
     _LAYER_NORM_SOURCE = r"""
@@ -149,6 +155,84 @@ extern "C" __global__ void softmax_backward(
         const int index = offset + column;
         input_gradients[index] =
             outputs[index] * (gradients[index] - projection);
+    }
+}
+"""
+    _SOFTMAX_SOURCE = r"""
+extern "C" __global__ void softmax_forward(
+    const float* inputs,
+    float* outputs,
+    const int width,
+    const int logarithmic
+) {
+    const int row = blockIdx.x;
+    const int thread = threadIdx.x;
+    const int offset = row * width;
+    __shared__ float values[256];
+
+    float maximum = -3.402823466e+38F;
+    for (int column = thread; column < width; column += blockDim.x) {
+        maximum = fmaxf(maximum, inputs[offset + column]);
+    }
+    values[thread] = maximum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (thread < stride) {
+            values[thread] = fmaxf(values[thread], values[thread + stride]);
+        }
+        __syncthreads();
+    }
+    maximum = values[0];
+
+    float total = 0.0f;
+    for (int column = thread; column < width; column += blockDim.x) {
+        total += expf(inputs[offset + column] - maximum);
+    }
+    values[thread] = total;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (thread < stride) values[thread] += values[thread + stride];
+        __syncthreads();
+    }
+    total = values[0];
+
+    for (int column = thread; column < width; column += blockDim.x) {
+        const int index = offset + column;
+        const float shifted = inputs[index] - maximum;
+        outputs[index] = logarithmic
+            ? shifted - logf(total)
+            : expf(shifted) / total;
+    }
+}
+"""
+    _LOG_SOFTMAX_BACKWARD_SOURCE = r"""
+extern "C" __global__ void log_softmax_backward(
+    const float* gradients,
+    const float* outputs,
+    float* input_gradients,
+    const int width
+) {
+    const int row = blockIdx.x;
+    const int thread = threadIdx.x;
+    const int offset = row * width;
+    __shared__ float values[256];
+
+    float projection = 0.0f;
+    for (int column = thread; column < width; column += blockDim.x) {
+        projection += gradients[offset + column];
+    }
+    values[thread] = projection;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (thread < stride) values[thread] += values[thread + stride];
+        __syncthreads();
+    }
+    projection = values[0];
+
+    for (int column = thread; column < width; column += blockDim.x) {
+        const int index = offset + column;
+        input_gradients[index] =
+            gradients[index] - expf(outputs[index]) * projection;
     }
 }
 """
@@ -250,6 +334,22 @@ extern "C" __global__ void layer_norm_backward(
         "relu": "cp.maximum({0}, 0)",
         "step": "cp.greater({0}, 0).astype({0}.dtype, copy=False)",
     }
+    _FUSED_BINARY = {
+        "add": "left_value + right_value",
+        "sub": "left_value - right_value",
+        "mul": "left_value * right_value",
+        "div": "left_value / right_value",
+        "equal": "left_value == right_value ? 1.0f : 0.0f",
+    }
+    _FUSED_UNARY = {
+        "identity": "input_value",
+        "neg": "-input_value",
+        "exp": "expf(input_value)",
+        "log": "logf(input_value)",
+        "sqrt": "sqrtf(input_value)",
+        "relu": "fmaxf(input_value, 0.0f)",
+        "step": "input_value > 0.0f ? 1.0f : 0.0f",
+    }
 
     def __init__(self) -> None:
         try:
@@ -273,18 +373,22 @@ extern "C" __global__ void layer_norm_backward(
         self._program_cache: Dict[object, Tuple[str, Callable[..., Any]]] = {}
         self._layer_norm_kernel: Optional[Any] = None
         self._layer_norm_backward_kernel: Optional[Any] = None
+        self._log_softmax_backward_kernel: Optional[Any] = None
+        self._softmax_kernel: Optional[Any] = None
         self._softmax_backward_kernel: Optional[Any] = None
+        self._elementwise_kernels: Dict[object, Any] = {}
         self._sgd_update_kernel: Optional[Any] = None
+        self._sgd_group_kernels: Dict[object, Any] = {}
 
     @property
     def cache_size(self) -> int:
         return len(self._program_cache)
 
     def close(self) -> None:
-        if not self._program_cache:
-            return
         self.device.synchronize()
         self._program_cache.clear()
+        self._elementwise_kernels.clear()
+        self._sgd_group_kernels.clear()
 
     def _load_input(self, node: LazyNode) -> Any:
         if "cuda" in node.native_values:
@@ -353,6 +457,67 @@ extern "C" __global__ void layer_norm_backward(
                 )
         return tuple(specifications), tuple(indexes[node] for node in outputs)
 
+    @classmethod
+    def _mark_elementwise_fusions(
+        cls, outputs: Sequence[LazyNode]
+    ) -> None:
+        nodes = cls._topological_sort(outputs)
+        consumers: Dict[LazyNode, int] = {}
+        for node in nodes:
+            for parent in cls._node_inputs(node):
+                consumers[parent] = consumers.get(parent, 0) + 1
+        output_nodes = set(outputs)
+
+        def eligible(node: LazyNode) -> bool:
+            return (
+                node.op is Op.ELEMENTWISE
+                and node.lowering is None
+                and node.dtype == np.dtype(np.float32)
+            )
+
+        inlineable = set()
+        for child in nodes:
+            if not eligible(child):
+                continue
+            for parent in child.inputs:
+                if (
+                    eligible(parent)
+                    and parent.shape == child.shape
+                    and consumers.get(parent) == 1
+                    and parent not in output_nodes
+                ):
+                    inlineable.add(parent)
+
+        for root in nodes:
+            if not eligible(root) or root in inlineable:
+                continue
+            inputs = []
+            input_indexes: Dict[LazyNode, int] = {}
+            fused_count = 0
+
+            def build(node: LazyNode) -> object:
+                nonlocal fused_count
+                if node is root or node in inlineable:
+                    fused_count += 1
+                    return (
+                        str(node.arg),
+                        *(build(parent) for parent in node.inputs),
+                    )
+                index = input_indexes.get(node)
+                if index is None:
+                    index = len(inputs)
+                    input_indexes[node] = index
+                    inputs.append(node)
+                return ("input", index)
+
+            expression = build(root)
+            if fused_count > 1:
+                root.lowering = (
+                    "elementwise_fusion",
+                    tuple(inputs),
+                    expression,
+                )
+
     def compile(
         self,
         outputs: Sequence[LazyNode],
@@ -376,6 +541,11 @@ extern "C" __global__ void layer_norm_backward(
         if cached is not None:
             source, run = cached
             return CUDAProgram(source, leaves, run, self.device, self._load_input)
+
+        self._mark_elementwise_fusions(outputs)
+        nodes = self._topological_sort(outputs)
+        leaves = tuple(node for node in nodes if node.op is None)
+        program_inputs = tuple(node for node in leaves if node in requested_dynamic)
 
         names = {node: f"v{index}" for index, node in enumerate(nodes)}
         leaf_indexes = {node: index for index, node in enumerate(leaves)}
@@ -442,8 +612,11 @@ extern "C" __global__ void layer_norm_backward(
             compile(source, "<chomikgrad-cuda>", "exec"),
             {
                 "cp": self._cp,
+                "fused_elementwise": self._fused_elementwise,
                 "layer_norm": self._layer_norm,
                 "layer_norm_backward": self._layer_norm_backward,
+                "log_softmax_backward": self._log_softmax_backward,
+                "softmax": self._softmax,
                 "softmax_backward": self._softmax_backward,
             },
             namespace,
@@ -486,25 +659,134 @@ extern "C" __global__ void layer_norm_backward(
         inplace: bool = False,
     ) -> Tuple[Tuple[LazyNode, ...], Tuple[LazyNode, ...]]:
         native_gradients = self.compile(gradients).run(synchronize=False)
-        native_parameters = [self._load_input(node) for node in parameters]
-        updated = tuple(
-            self._update_parameter(
-                parameter,
-                gradient,
-                learning_rate,
-                inplace=inplace,
-            )
-            for parameter, gradient in zip(native_parameters, native_gradients)
+        return self.update_native_parameters(
+            parameters,
+            native_gradients,
+            learning_rate,
+            inplace=inplace,
         )
+
+    def update_native_parameters(
+        self,
+        parameters: Sequence[LazyNode],
+        gradients: Sequence[object],
+        learning_rate: float,
+        *,
+        inplace: bool = False,
+    ) -> Tuple[Tuple[LazyNode, ...], Tuple[LazyNode, ...]]:
+        if len(parameters) != len(gradients):
+            raise ValueError("parameter and gradient counts must match")
+        native_parameters = tuple(self._load_input(node) for node in parameters)
+        cp = self._cp
+        can_fuse = all(
+            parameter.dtype == cp.float32
+            and gradient.dtype == cp.float32
+            and parameter.flags.c_contiguous
+            and gradient.flags.c_contiguous
+            and parameter.shape == gradient.shape
+            for parameter, gradient in zip(native_parameters, gradients)
+        )
+        if can_fuse:
+            updated_values = []
+            for start in range(0, len(parameters), self._SGD_FUSION_GROUP_SIZE):
+                end = start + self._SGD_FUSION_GROUP_SIZE
+                updated_values.extend(
+                    self._update_parameter_group(
+                        native_parameters[start:end],
+                        gradients[start:end],
+                        learning_rate,
+                        inplace=inplace,
+                    )
+                )
+            updated = tuple(updated_values)
+        else:
+            updated = tuple(
+                self._update_parameter(
+                    parameter,
+                    gradient,
+                    learning_rate,
+                    inplace=inplace,
+                )
+                for parameter, gradient in zip(native_parameters, gradients)
+            )
         parameter_nodes = tuple(
             LazyNode.native_leaf("cuda", value, node.shape, node.dtype)
             for node, value in zip(parameters, updated)
         )
         gradient_nodes = tuple(
             LazyNode.native_leaf("cuda", value, node.shape, node.dtype)
-            for node, value in zip(parameters, native_gradients)
+            for node, value in zip(parameters, gradients)
         )
         return parameter_nodes, gradient_nodes
+
+    def _update_parameter_group(
+        self,
+        parameters: Sequence[Any],
+        gradients: Sequence[object],
+        learning_rate: float,
+        *,
+        inplace: bool,
+    ) -> Tuple[Any, ...]:
+        cp = self._cp
+        outputs = (
+            tuple(parameters)
+            if inplace
+            else tuple(cp.empty_like(parameter) for parameter in parameters)
+        )
+        sizes = tuple(int(parameter.size) for parameter in parameters)
+        total = sum(sizes)
+        if total == 0:
+            return outputs
+
+        key = (sizes, inplace)
+        kernel = self._sgd_group_kernels.get(key)
+        if kernel is None:
+            declarations = []
+            branches = []
+            offset = 0
+            for index, size in enumerate(sizes):
+                declarations.extend(
+                    (
+                        f"    {'float' if inplace else 'const float'}* "
+                        f"parameter_{index}",
+                        f"    const float* gradient_{index}",
+                    )
+                )
+                output_name = f"parameter_{index}"
+                if not inplace:
+                    declarations.append(f"    float* output_{index}")
+                    output_name = f"output_{index}"
+                end = offset + size
+                branches.append(
+                    f"    if (gid < {end}ULL) {{\n"
+                    f"        const unsigned long long item = gid - {offset}ULL;\n"
+                    f"        {output_name}[item] = parameter_{index}[item] - "
+                    f"learning_rate * gradient_{index}[item];\n"
+                    f"        return;\n"
+                    f"    }}"
+                )
+                offset = end
+            declarations.append("    const float learning_rate")
+            source = f"""
+extern "C" __global__ void sgd_update_group(
+{',\n'.join(declarations)}
+) {{
+    const unsigned long long gid =
+        (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+{chr(10).join(branches)}
+}}
+"""
+            kernel = cp.RawKernel(source, "sgd_update_group")
+            self._sgd_group_kernels[key] = kernel
+
+        arguments = []
+        for parameter, gradient, output in zip(parameters, gradients, outputs):
+            arguments.extend((parameter, gradient))
+            if not inplace:
+                arguments.append(output)
+        arguments.append(np.float32(learning_rate))
+        kernel(((total + 255) // 256,), (256,), tuple(arguments))
+        return outputs
 
     def _update_parameter(
         self,
@@ -535,14 +817,31 @@ extern "C" __global__ void layer_norm_backward(
     def _expression(self, node: LazyNode, args: Sequence[str]) -> str:
         if node.lowering is not None and node.lowering[0] in self._SUPPORTED_LOWERINGS:
             kind, _, argument = node.lowering
+            if kind == "elementwise_fusion":
+                rendered_inputs = ", ".join(args)
+                if len(args) == 1:
+                    rendered_inputs += ","
+                return (
+                    f"fused_elementwise({argument!r}, "
+                    f"({rendered_inputs}), {node.shape!r})"
+                )
             if kind == "layer_norm":
                 return (
                     f"layer_norm({args[0]}, {args[1]}, {args[2]}, "
                     f"{float(argument)!r})"
                 )
+            if kind == "softmax":
+                return f"softmax({args[0]}, {int(argument)!r}, False)"
+            if kind == "log_softmax":
+                return f"softmax({args[0]}, {int(argument)!r}, True)"
             if kind == "softmax_backward":
                 return (
                     f"softmax_backward({args[0]}, {args[1]}, "
+                    f"{int(argument)!r})"
+                )
+            if kind == "log_softmax_backward":
+                return (
+                    f"log_softmax_backward({args[0]}, {args[1]}, "
                     f"{int(argument)!r})"
                 )
             if kind == "layer_norm_backward":
@@ -594,6 +893,53 @@ extern "C" __global__ void layer_norm_backward(
             return f"cp.take({args[0]}, {args[1]}, axis=0)"
         raise ValueError(f"unsupported operation: {node.op}")
 
+    def _fused_elementwise(
+        self,
+        expression: object,
+        inputs: Sequence[Any],
+        output_shape: Tuple[int, ...],
+    ) -> Any:
+        cp = self._cp
+        if any(value.dtype != cp.float32 for value in inputs):
+            raise TypeError("CUDA fused elementwise operations require float32")
+
+        def render(node: object) -> str:
+            parts = tuple(node)  # type: ignore[arg-type]
+            kind = str(parts[0])
+            if kind == "input":
+                return f"input_{int(parts[1])}"
+            if kind in self._FUSED_BINARY:
+                left = render(parts[1])
+                right = render(parts[2])
+                return (
+                    self._FUSED_BINARY[kind]
+                    .replace("left_value", f"({left})")
+                    .replace("right_value", f"({right})")
+                )
+            if kind in self._FUSED_UNARY:
+                value = render(parts[1])
+                return self._FUSED_UNARY[kind].replace(
+                    "input_value", f"({value})"
+                )
+            raise ValueError(f"unsupported fused elementwise operation: {kind}")
+
+        key = (expression, len(inputs))
+        kernel = self._elementwise_kernels.get(key)
+        if kernel is None:
+            input_parameters = ", ".join(
+                f"float32 input_{index}" for index in range(len(inputs))
+            )
+            kernel = cp.ElementwiseKernel(
+                input_parameters,
+                "float32 output",
+                f"output = {render(expression)}",
+                f"chomik_fused_elementwise_{len(self._elementwise_kernels)}",
+            )
+            self._elementwise_kernels[key] = kernel
+        output = cp.empty(output_shape, dtype=cp.float32)
+        kernel(*inputs, output)
+        return output
+
     def _layer_norm(
         self,
         inputs: Any,
@@ -629,6 +975,70 @@ extern "C" __global__ void layer_norm_backward(
             (inputs, weight, bias, output, np.int32(width), np.float32(epsilon)),
         )
         return output
+
+    def _softmax(self, inputs: Any, axis: int, logarithmic: bool) -> Any:
+        cp = self._cp
+        if inputs.size == 0:
+            return cp.empty_like(inputs)
+        if (
+            axis != inputs.ndim - 1
+            or inputs.dtype != cp.float32
+            or not inputs.flags.c_contiguous
+        ):
+            maximum = cp.max(inputs, axis=axis, keepdims=True)
+            shifted = inputs - maximum
+            exponentials = cp.exp(shifted)
+            total = cp.sum(exponentials, axis=axis, keepdims=True)
+            return shifted - cp.log(total) if logarithmic else exponentials / total
+
+        if self._softmax_kernel is None:
+            self._softmax_kernel = cp.RawKernel(
+                self._SOFTMAX_SOURCE,
+                "softmax_forward",
+            )
+        output = cp.empty_like(inputs)
+        width = inputs.shape[-1]
+        rows = inputs.size // width
+        self._softmax_kernel(
+            (rows,),
+            (256,),
+            (inputs, output, np.int32(width), np.int32(logarithmic)),
+        )
+        return output
+
+    def _log_softmax_backward(
+        self,
+        gradients: Any,
+        outputs: Any,
+        axis: int,
+    ) -> Any:
+        cp = self._cp
+        if gradients.size == 0:
+            return cp.empty_like(gradients)
+        if (
+            axis != gradients.ndim - 1
+            or gradients.dtype != cp.float32
+            or outputs.dtype != cp.float32
+            or not gradients.flags.c_contiguous
+            or not outputs.flags.c_contiguous
+        ):
+            projection = cp.sum(gradients, axis=axis, keepdims=True)
+            return gradients - cp.exp(outputs) * projection
+
+        if self._log_softmax_backward_kernel is None:
+            self._log_softmax_backward_kernel = cp.RawKernel(
+                self._LOG_SOFTMAX_BACKWARD_SOURCE,
+                "log_softmax_backward",
+            )
+        input_gradients = cp.empty_like(gradients)
+        width = gradients.shape[-1]
+        rows = gradients.size // width
+        self._log_softmax_backward_kernel(
+            (rows,),
+            (256,),
+            (gradients, outputs, input_gradients, np.int32(width)),
+        )
+        return input_gradients
 
     def _softmax_backward(
         self,

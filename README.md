@@ -145,7 +145,14 @@ CUDA, dlatego wystarczy zgodny sterownik NVIDIA:
 python -m pip install '.[benchmark,cuda]'
 python -m pip install torch --index-url https://download.pytorch.org/whl/cu130
 python benchmarks/compare_tinygrad_10_cases.py --device cuda --trials 3
+python benchmarks/compare_tinygrad_10_cases.py --device cuda --trials 5 --chomik-jit
 ```
+
+Opcjonalny `compile_train_step` przechwytuje stałokształtny forward i backward
+tylko raz. CUDA scala łańcuchy elementwise, softmax/log-softmax oraz aktualizacje
+SGD w grupy do 16 parametrów. Jest to replay wygenerowanego programu Chomika,
+nie CUDA Graph: CuPy 14.2 nie pozwala obecnie przechwycić używanego tutaj
+`cp.matmul`, ponieważ ustawianie streamu cuBLAS podczas capture jest niewspierane.
 
 Na natywnym Windows wariant `torch-compile` używa oficjalnego backendu
 `cudagraphs`, ponieważ wheel PyTorch nie zawiera Tritona. Na systemie z
@@ -389,7 +396,7 @@ wyników oraz accuracy; nie zawiera niestabilnych progów czasowych:
 Na NVIDIA/CUDA użyj `--device cuda`, dla OpenCL `--device opencl`, a dla Vulkan
 `--device vulkan`; domyślny tryb `metal` zachowuje dotychczasowe zachowanie na
 Apple Silicon. Flaga `--micro-only` pomija dwa długie przypadki treningowe.
-Opcja `--chomik-jit` przechwytuje oba treningi Chomika i obecnie wymaga OpenCL.
+Opcja `--chomik-jit` przechwytuje oba treningi Chomika na CUDA albo OpenCL.
 
 Skrypt `benchmarks/transformer_vs_tinygrad.py` pozostaje krótszym benchmarkiem
 samego transformera.
@@ -434,6 +441,18 @@ PyTorch eager wygrał wszystkie dziesięć przypadków. Kontrole fingerprintów 
 accuracy przeszły dla wszystkich frameworków. Mikrobenchmarki obejmują transfer
 wejścia z NumPy na GPU oraz odczyt wyniku z powrotem do NumPy. Fused backward
 softmax i LayerNorm skrócił trening transformera z 2,257 s do 1,682 s.
+
+Po dodaniu CUDA JIT wykonano pięć naprzemiennych prób eager/JIT w jednym
+procesie. Mediany dla aktualnej implementacji wyniosły:
+
+| trening | Chomik CUDA | Chomik CUDA JIT | przyspieszenie |
+|---|---:|---:|---:|
+| MLP, 20 epok | 0,427 s | **0,233 s** | 1,83× |
+| transformer, 10 epok | 1,640 s | **0,987 s** | 1,66× |
+
+Accuracy pozostało w dotychczasowym zakresie. Te liczby są osobną serią A/B i
+nie należy mieszać ich z wcześniejszą czteroframeworkową tabelą, wykonaną przy
+innym obciążeniu GPU.
 
 ### Inference rdzenia LLM około 1B
 

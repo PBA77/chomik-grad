@@ -656,8 +656,8 @@ def main() -> None:
     arguments = parser.parse_args()
     if arguments.trials <= 0 or arguments.repeat_scale <= 0:
         parser.error("trials and repeat scale must be positive")
-    if arguments.chomik_jit and arguments.device != "opencl":
-        parser.error("--chomik-jit currently requires --device opencl")
+    if arguments.chomik_jit and arguments.device not in ("cuda", "opencl"):
+        parser.error("--chomik-jit currently requires --device cuda or opencl")
 
     if arguments.worker:
         print(
