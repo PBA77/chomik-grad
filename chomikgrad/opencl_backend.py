@@ -10,7 +10,15 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .lazy import Compiler, CompiledProgram, DeviceAdapter, LazyNode, Op
+from .lazy import (
+    Compiler,
+    CompiledProgram,
+    DeviceAdapter,
+    GraphPlan,
+    LazyNode,
+    Op,
+    build_python_program,
+)
 
 
 class _OpenCLArrayView:
@@ -358,131 +366,6 @@ class OpenCLCompiler(Compiler):
             node.native_values["opencl"] = native
         return native
 
-    @classmethod
-    def _node_inputs(cls, node: LazyNode) -> Tuple[LazyNode, ...]:
-        if (
-            node.lowering is not None
-            and node.lowering[0] in cls._SUPPORTED_LOWERINGS
-        ):
-            return node.lowering[1]
-        return node.inputs
-
-    @classmethod
-    def _topological_sort(
-        cls, outputs: Sequence[LazyNode]
-    ) -> Tuple[LazyNode, ...]:
-        ordered = []
-        visited = set()
-
-        def visit(node: LazyNode) -> None:
-            if node in visited:
-                return
-            visited.add(node)
-            for parent in cls._node_inputs(node):
-                visit(parent)
-            ordered.append(node)
-
-        for output in outputs:
-            visit(output)
-        return tuple(ordered)
-
-    @classmethod
-    def _signature(
-        cls, nodes: Sequence[LazyNode], outputs: Sequence[LazyNode]
-    ) -> object:
-        indexes = {node: index for index, node in enumerate(nodes)}
-        specifications = []
-        for node in nodes:
-            if node.op is None:
-                specifications.append((None, node.shape, node.dtype.str))
-            elif (
-                node.lowering is not None
-                and node.lowering[0] in cls._SUPPORTED_LOWERINGS
-            ):
-                kind, inputs, argument = node.lowering
-                specifications.append(
-                    (
-                        "lowering",
-                        kind,
-                        argument,
-                        node.shape,
-                        node.dtype.str,
-                        tuple(indexes[parent] for parent in inputs),
-                    )
-                )
-            else:
-                specifications.append(
-                    (
-                        node.op.value,
-                        node.arg,
-                        node.shape,
-                        node.dtype.str,
-                        tuple(indexes[parent] for parent in node.inputs),
-                    )
-                )
-        return tuple(specifications), tuple(indexes[node] for node in outputs)
-
-    @classmethod
-    def _mark_elementwise_fusions(
-        cls, outputs: Sequence[LazyNode]
-    ) -> None:
-        nodes = cls._topological_sort(outputs)
-        consumers: Dict[LazyNode, int] = {}
-        for node in nodes:
-            for parent in cls._node_inputs(node):
-                consumers[parent] = consumers.get(parent, 0) + 1
-        output_nodes = set(outputs)
-
-        def eligible(node: LazyNode) -> bool:
-            return (
-                node.op is Op.ELEMENTWISE
-                and node.lowering is None
-                and node.dtype == np.dtype(np.float32)
-            )
-
-        inlineable = set()
-        for child in nodes:
-            if not eligible(child):
-                continue
-            for parent in child.inputs:
-                if (
-                    eligible(parent)
-                    and parent.shape == child.shape
-                    and consumers.get(parent) == 1
-                    and parent not in output_nodes
-                ):
-                    inlineable.add(parent)
-
-        for root in nodes:
-            if not eligible(root) or root in inlineable:
-                continue
-            inputs = []
-            input_indexes: Dict[LazyNode, int] = {}
-            fused_count = 0
-
-            def build(node: LazyNode) -> object:
-                nonlocal fused_count
-                if node is root or node in inlineable:
-                    fused_count += 1
-                    return (
-                        str(node.arg),
-                        *(build(parent) for parent in node.inputs),
-                    )
-                index = input_indexes.get(node)
-                if index is None:
-                    index = len(inputs)
-                    input_indexes[node] = index
-                    inputs.append(node)
-                return ("input", index)
-
-            expression = build(root)
-            if fused_count > 1:
-                root.lowering = (
-                    "elementwise_fusion",
-                    tuple(inputs),
-                    expression,
-                )
-
     def compile(
         self,
         outputs: Sequence[LazyNode],
@@ -493,86 +376,24 @@ class OpenCLCompiler(Compiler):
         if any(node.op is not None for node in dynamic_inputs):
             raise ValueError("dynamic inputs must be graph leaves")
 
-        nodes = self._topological_sort(outputs)
+        plan = GraphPlan(outputs, self._SUPPORTED_LOWERINGS)
+        nodes = plan.nodes()
         leaves = tuple(node for node in nodes if node.op is None)
         requested_dynamic = set(dynamic_inputs)
         if not requested_dynamic.issubset(leaves):
             raise ValueError("dynamic input is not a leaf of the compiled graph")
         specialized = bool(dynamic_inputs)
-        signature = self._signature(nodes, outputs)
+        signature = plan.signature(nodes)
         cached = None if specialized else self._program_cache.get(signature)
         if cached is not None:
             source, run = cached
             return OpenCLProgram(source, leaves, run, self.device, self._load_input)
 
-        self._mark_elementwise_fusions(outputs)
-        nodes = self._topological_sort(outputs)
-        leaves = tuple(node for node in nodes if node.op is None)
-        program_inputs = tuple(node for node in leaves if node in requested_dynamic)
-
-        names = {node: f"v{index}" for index, node in enumerate(nodes)}
-        leaf_indexes = {node: index for index, node in enumerate(leaves)}
-        last_uses: Dict[LazyNode, int] = {}
-        bundle_last_uses: Dict[object, int] = {}
-        for index, node in enumerate(nodes):
-            for parent in self._node_inputs(node):
-                last_uses[parent] = index
-            if (
-                node.lowering is not None
-                and node.lowering[0] == "layer_norm_backward"
-            ):
-                _, lowering_inputs, argument = node.lowering
-                epsilon, _ = argument
-                bundle_last_uses[(lowering_inputs, float(epsilon))] = index
-        for output in outputs:
-            last_uses[output] = len(nodes)
-        releases: Dict[int, list[str]] = {}
-        for node, index in last_uses.items():
-            if index < len(nodes):
-                releases.setdefault(index, []).append(names[node])
-
-        lines = ["def run(inputs):"]
-        lowering_bundles: Dict[object, str] = {}
-        for index, node in enumerate(nodes):
-            name = names[node]
-            if node.op is None:
-                lines.append(f"    {name} = inputs[{leaf_indexes[node]}]")
-                continue
-            args = [names[parent] for parent in self._node_inputs(node)]
-            if (
-                node.lowering is not None
-                and node.lowering[0] == "layer_norm_backward"
-            ):
-                _, lowering_inputs, argument = node.lowering
-                epsilon, component = argument
-                key = (lowering_inputs, float(epsilon))
-                bundle = lowering_bundles.get(key)
-                if bundle is None:
-                    bundle = f"{name}_bundle"
-                    lowering_bundles[key] = bundle
-                    lines.append(
-                        f"    {bundle} = layer_norm_backward("
-                        f"{args[0]}, {args[1]}, {args[2]}, "
-                        f"{float(epsilon)!r})"
-                    )
-                lines.append(f"    {name} = {bundle}[{int(component)}]")
-                if bundle_last_uses[key] == index:
-                    lines.append(f"    del {bundle}")
-            else:
-                lines.append(f"    {name} = {self._expression(node, args)}")
-            released = releases.get(index)
-            if released:
-                lines.append(f"    del {', '.join(released)}")
-
-        rendered_outputs = ", ".join(names[node] for node in outputs)
-        if len(outputs) == 1:
-            rendered_outputs += ","
-        lines.append(f"    return ({rendered_outputs})")
-        source = "\n".join(lines)
-
-        namespace: Dict[str, object] = {}
-        exec(
-            compile(source, "<chomikgrad-opencl>", "exec"),
+        plan.fuse_elementwise()
+        generated = build_python_program(
+            plan,
+            dynamic_inputs,
+            self._expression,
             {
                 "binary": self._binary,
                 "fused_elementwise": self._fused_elementwise,
@@ -588,45 +409,30 @@ class OpenCLCompiler(Compiler):
                 "softmax_backward": self._softmax_backward,
                 "unary": self._unary,
             },
-            namespace,
+            self._load_input,
+            "<chomikgrad-opencl>",
         )
-        raw_run = namespace["run"]
-        if specialized:
-            dynamic_indexes = {
-                node: index for index, node in enumerate(program_inputs)
-            }
-            template = [
-                None if node in requested_dynamic else self._load_input(node)
-                for node in leaves
-            ]
+        if not specialized:
+            self._program_cache[signature] = generated.source, generated.run
 
-            def run(values: Sequence[Any]) -> Tuple[Any, ...]:
-                merged = list(template)
-                for leaf_index, node in enumerate(leaves):
-                    if node in dynamic_indexes:
-                        merged[leaf_index] = values[dynamic_indexes[node]]
-                return raw_run(merged)
-
-        else:
-            run = raw_run
-            self._program_cache[signature] = source, run
-
-        return OpenCLProgram(  # type: ignore[arg-type]
-            source,
-            program_inputs if specialized else leaves,
-            run,
+        return OpenCLProgram(
+            generated.source,
+            generated.inputs,
+            generated.run,
             self.device,
             self._load_input,
         )
 
-    def _expression(self, node: LazyNode, args: Sequence[str]) -> str:
+    def _expression(
+        self,
+        node: LazyNode,
+        args: Sequence[str],
+        lowering: Optional[Tuple[str, Tuple[LazyNode, ...], object]] = None,
+    ) -> str:
         if node.dtype != np.dtype(np.float32) and node.op is not Op.GATHER:
             raise TypeError("the OpenCL backend currently supports FP32 operations")
-        if (
-            node.lowering is not None
-            and node.lowering[0] in self._SUPPORTED_LOWERINGS
-        ):
-            kind, _, argument = node.lowering
+        if lowering is not None:
+            kind, _, argument = lowering
             if kind == "elementwise_fusion":
                 rendered_inputs = ", ".join(args)
                 if len(args) == 1:

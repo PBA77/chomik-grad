@@ -22,6 +22,12 @@ Operacje na `Tensor` wyłącznie budują graf. `numpy()`, `item()`, `realize()` 
 wtyczka `cpu` generuje prostoliniową funkcję Pythona z wywołaniami NumPy, a
 następnie ją wykonuje.
 
+CUDA i OpenCL najpierw budują lokalny dla backendu `GraphPlan`. Plan wybiera
+obsługiwane loweringi i fuzje bez zapisywania ich w `LazyNode`, dlatego
+kompilacja jednego backendu nie zmienia grafu używanego później przez inny.
+Oba backendy korzystają ze wspólnej analizy grafu i generatora prostoliniowego
+programu Pythona; różnią się wyłącznie mapowaniem operacji na natywne kernele.
+
 ```python
 import numpy as np
 from chomikgrad import Linear, SGD, Tensor, cross_entropy
@@ -362,6 +368,11 @@ python -m unittest discover -s tests -v
 python -m pip install '.[demo]'
 python examples/train_digits.py
 ```
+
+Zestaw testów obejmuje również izolację planów backendów: fuzja elementwise w
+planie CUDA lub OpenCL nie może zmienić przenośnego grafu ani planu innego
+backendu. Ostatnia pełna weryfikacja objęła 70 testów; 14 opcjonalnych testów
+backendów niedostępnych na tym hoście zostało pominiętych.
 
 Demo trenuje MLP `64 -> 48 -> 10` na wbudowanym w scikit-learn darmowym
 zbiorze cyfr 8×8. Skrypt kończy się błędem, jeśli test accuracy nie osiągnie 90%.

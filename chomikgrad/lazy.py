@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import (
+    Any,
     Callable,
     Dict,
     Iterable,
@@ -230,6 +231,272 @@ def topological_sort(
     for output in outputs:
         visit(output)
     return tuple(ordered)
+
+
+class GraphPlan:
+    """Backend-local lowering choices and graph analysis."""
+
+    def __init__(
+        self,
+        outputs: Sequence[LazyNode],
+        supported_lowerings: Iterable[str],
+    ) -> None:
+        if not outputs:
+            raise ValueError("at least one output is required")
+        self.outputs = tuple(outputs)
+        self.supported_lowerings = frozenset(supported_lowerings)
+        self._overrides: Dict[
+            LazyNode, Tuple[str, Tuple[LazyNode, ...], object]
+        ] = {}
+
+    def lowering(
+        self, node: LazyNode
+    ) -> Optional[Tuple[str, Tuple[LazyNode, ...], object]]:
+        override = self._overrides.get(node)
+        if override is not None:
+            return override
+        intrinsic = node.lowering
+        if (
+            intrinsic is not None
+            and intrinsic[0] in self.supported_lowerings
+        ):
+            return intrinsic
+        return None
+
+    def inputs(self, node: LazyNode) -> Tuple[LazyNode, ...]:
+        lowering = self.lowering(node)
+        return lowering[1] if lowering is not None else node.inputs
+
+    def nodes(self) -> Tuple[LazyNode, ...]:
+        ordered = []
+        visited = set()
+
+        def visit(node: LazyNode) -> None:
+            if node in visited:
+                return
+            visited.add(node)
+            for parent in self.inputs(node):
+                visit(parent)
+            ordered.append(node)
+
+        for output in self.outputs:
+            visit(output)
+        return tuple(ordered)
+
+    def signature(self, nodes: Optional[Sequence[LazyNode]] = None) -> object:
+        selected = tuple(nodes) if nodes is not None else self.nodes()
+        indexes = {node: index for index, node in enumerate(selected)}
+        specifications = []
+        for node in selected:
+            lowering = self.lowering(node)
+            if node.op is None:
+                specifications.append((None, node.shape, node.dtype.str))
+            elif lowering is not None:
+                kind, inputs, argument = lowering
+                specifications.append(
+                    (
+                        "lowering",
+                        kind,
+                        argument,
+                        node.shape,
+                        node.dtype.str,
+                        tuple(indexes[parent] for parent in inputs),
+                    )
+                )
+            else:
+                specifications.append(
+                    (
+                        node.op.value,
+                        node.arg,
+                        node.shape,
+                        node.dtype.str,
+                        tuple(indexes[parent] for parent in node.inputs),
+                    )
+                )
+        return (
+            tuple(specifications),
+            tuple(indexes[node] for node in self.outputs),
+        )
+
+    def fuse_elementwise(self) -> None:
+        nodes = self.nodes()
+        consumers: Dict[LazyNode, int] = {}
+        for node in nodes:
+            for parent in self.inputs(node):
+                consumers[parent] = consumers.get(parent, 0) + 1
+        output_nodes = set(self.outputs)
+
+        def eligible(node: LazyNode) -> bool:
+            return (
+                node.op is Op.ELEMENTWISE
+                and node.lowering is None
+                and node not in self._overrides
+                and node.dtype == np.dtype(np.float32)
+            )
+
+        inlineable = set()
+        for child in nodes:
+            if not eligible(child):
+                continue
+            for parent in child.inputs:
+                if (
+                    eligible(parent)
+                    and parent.shape == child.shape
+                    and consumers.get(parent) == 1
+                    and parent not in output_nodes
+                ):
+                    inlineable.add(parent)
+
+        for root in nodes:
+            if not eligible(root) or root in inlineable:
+                continue
+            inputs = []
+            input_indexes: Dict[LazyNode, int] = {}
+            fused_count = 0
+
+            def build(node: LazyNode) -> object:
+                nonlocal fused_count
+                if node is root or node in inlineable:
+                    fused_count += 1
+                    return (
+                        str(node.arg),
+                        *(build(parent) for parent in node.inputs),
+                    )
+                index = input_indexes.get(node)
+                if index is None:
+                    index = len(inputs)
+                    input_indexes[node] = index
+                    inputs.append(node)
+                return ("input", index)
+
+            expression = build(root)
+            if fused_count > 1:
+                self._overrides[root] = (
+                    "elementwise_fusion",
+                    tuple(inputs),
+                    expression,
+                )
+
+
+@dataclass
+class GeneratedPythonProgram:
+    source: str
+    leaves: Tuple[LazyNode, ...]
+    inputs: Tuple[LazyNode, ...]
+    run: Callable[[Sequence[Any]], Tuple[Any, ...]]
+
+
+def build_python_program(
+    plan: GraphPlan,
+    dynamic_inputs: Sequence[LazyNode],
+    render_expression: Callable[
+        [
+            LazyNode,
+            Sequence[str],
+            Optional[Tuple[str, Tuple[LazyNode, ...], object]],
+        ],
+        str,
+    ],
+    namespace: Mapping[str, object],
+    load_input: Callable[[LazyNode], object],
+    filename: str,
+) -> GeneratedPythonProgram:
+    """Build the shared straight-line Python runtime used by GPU backends."""
+
+    nodes = plan.nodes()
+    leaves = tuple(node for node in nodes if node.op is None)
+    requested_dynamic = set(dynamic_inputs)
+    if not requested_dynamic.issubset(leaves):
+        raise ValueError("dynamic input is not a leaf of the compiled graph")
+    program_inputs = tuple(node for node in leaves if node in requested_dynamic)
+
+    names = {node: f"v{index}" for index, node in enumerate(nodes)}
+    leaf_indexes = {node: index for index, node in enumerate(leaves)}
+    last_uses: Dict[LazyNode, int] = {}
+    bundle_last_uses: Dict[object, int] = {}
+    for index, node in enumerate(nodes):
+        lowering = plan.lowering(node)
+        for parent in plan.inputs(node):
+            last_uses[parent] = index
+        if lowering is not None and lowering[0] == "layer_norm_backward":
+            _, lowering_inputs, argument = lowering
+            epsilon, _ = argument  # type: ignore[misc]
+            bundle_last_uses[(lowering_inputs, float(epsilon))] = index
+    for output in plan.outputs:
+        last_uses[output] = len(nodes)
+    releases: Dict[int, list[str]] = {}
+    for node, index in last_uses.items():
+        if index < len(nodes):
+            releases.setdefault(index, []).append(names[node])
+
+    lines = ["def run(inputs):"]
+    lowering_bundles: Dict[object, str] = {}
+    for index, node in enumerate(nodes):
+        name = names[node]
+        if node.op is None:
+            lines.append(f"    {name} = inputs[{leaf_indexes[node]}]")
+            continue
+        lowering = plan.lowering(node)
+        args = [names[parent] for parent in plan.inputs(node)]
+        if lowering is not None and lowering[0] == "layer_norm_backward":
+            _, lowering_inputs, argument = lowering
+            epsilon, component = argument  # type: ignore[misc]
+            key = (lowering_inputs, float(epsilon))
+            bundle = lowering_bundles.get(key)
+            if bundle is None:
+                bundle = f"{name}_bundle"
+                lowering_bundles[key] = bundle
+                lines.append(
+                    f"    {bundle} = layer_norm_backward("
+                    f"{args[0]}, {args[1]}, {args[2]}, "
+                    f"{float(epsilon)!r})"
+                )
+            lines.append(f"    {name} = {bundle}[{int(component)}]")
+            if bundle_last_uses[key] == index:
+                lines.append(f"    del {bundle}")
+        else:
+            lines.append(
+                f"    {name} = {render_expression(node, args, lowering)}"
+            )
+        released = releases.get(index)
+        if released:
+            lines.append(f"    del {', '.join(released)}")
+
+    rendered_outputs = ", ".join(names[node] for node in plan.outputs)
+    if len(plan.outputs) == 1:
+        rendered_outputs += ","
+    lines.append(f"    return ({rendered_outputs})")
+    source = "\n".join(lines)
+
+    compiled_namespace: Dict[str, object] = {}
+    exec(
+        compile(source, filename, "exec"),
+        dict(namespace),
+        compiled_namespace,
+    )
+    raw_run = compiled_namespace["run"]
+    if dynamic_inputs:
+        dynamic_indexes = {
+            node: index for index, node in enumerate(program_inputs)
+        }
+        template = [
+            None if node in requested_dynamic else load_input(node)
+            for node in leaves
+        ]
+
+        def run(values: Sequence[Any]) -> Tuple[Any, ...]:
+            merged = list(template)
+            for leaf_index, node in enumerate(leaves):
+                if node in dynamic_indexes:
+                    merged[leaf_index] = values[dynamic_indexes[node]]
+            return raw_run(merged)  # type: ignore[operator,no-any-return]
+
+        inputs = program_inputs
+    else:
+        run = raw_run  # type: ignore[assignment]
+        inputs = leaves
+
+    return GeneratedPythonProgram(source, leaves, inputs, run)
 
 
 @dataclass

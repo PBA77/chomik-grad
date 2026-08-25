@@ -10,6 +10,7 @@ from chomikgrad import (
     compile_graph,
     register_compiler,
 )
+from chomikgrad.lazy import GraphPlan
 
 
 class RecordingCompiler(Compiler):
@@ -63,6 +64,26 @@ class LazyExecutionTests(unittest.TestCase):
 
     def test_instruction_set_has_only_six_operations(self) -> None:
         self.assertEqual(len(Op), 6)
+
+    def test_backend_plans_do_not_leak_elementwise_fusions(self) -> None:
+        source = Tensor([1.0, -2.0], dtype=np.float32)
+        output = ((source + 1.0) * 2.0).relu()
+        portable_plan = GraphPlan((output._node,), ())
+        portable_nodes = portable_plan.nodes()
+        original_lowerings = tuple(node.lowering for node in portable_nodes)
+
+        fused_plan = GraphPlan((output._node,), {"elementwise_fusion"})
+        fused_plan.fuse_elementwise()
+
+        lowering = fused_plan.lowering(output._node)
+        self.assertIsNotNone(lowering)
+        self.assertEqual(lowering[0], "elementwise_fusion")
+        self.assertLess(len(fused_plan.nodes()), len(portable_nodes))
+        self.assertEqual(portable_plan.nodes(), portable_nodes)
+        self.assertEqual(
+            tuple(node.lowering for node in portable_nodes),
+            original_lowerings,
+        )
 
     def test_gather_forward_and_repeated_index_gradient(self) -> None:
         table = Tensor(
