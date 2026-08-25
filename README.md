@@ -141,3 +141,19 @@ Przykładowy wynik głównego benchmarku na Apple M1 Max (`tinygrad 0.14.0`,
 
 To mały model, więc wynik mierzy również narzut kompilacji i Pythona. Na innych
 wersjach bibliotek oraz układach Apple proporcje mogą być inne.
+
+### Inference rdzenia LLM około 1B
+
+Drugi benchmark buduje decoder-only transformer core bez embeddingu,
+tokenizera i LM headu. Domyślna konfiguracja ma 20 bloków, szerokość 2048,
+16 głów, FFN 8192, sekwencję 32 i dokładnie 1 007 169 536 parametrów:
+
+```bash
+.venv/bin/python benchmarks/llm_1b_inference.py
+.venv/bin/python benchmarks/llm_1b_inference.py --json
+```
+
+Na M1 Max, FP32 i `batch=1` mediana dziesięciu rozgrzanych forwardów wyniosła
+32,83 ms dla Chomika oraz 40,38 ms dla tinygrad. Pierwszy forward trwał
+odpowiednio 0,62 s i 2,63 s. Jest to prefill syntetycznych hidden states, a nie
+autoregresywne generowanie z KV cache.
