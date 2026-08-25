@@ -12,6 +12,7 @@ from .lazy import (
 )
 from .mlx_backend import MLXCompiler, MLXDeviceAdapter, MLXProgram
 from .coreml_backend import CoreMLCompiler, CoreMLDeviceAdapter, CoreMLProgram
+from .cuda_backend import CUDACompiler, CUDADeviceAdapter, CUDAProgram
 from .generation import GreedyVerification, verify_greedy_candidates
 from .llama import (
     LlamaConfig,
@@ -36,10 +37,14 @@ from .tensor import Tensor, compile_graph, no_grad, realize
 
 register_compiler("mlx", MLXCompiler)
 register_compiler("coreml", CoreMLCompiler)
+register_compiler("cuda", CUDACompiler)
 
 __all__ = [
     "Compiler",
     "CompiledProgram",
+    "CUDACompiler",
+    "CUDADeviceAdapter",
+    "CUDAProgram",
     "CoreMLCompiler",
     "CoreMLDeviceAdapter",
     "CoreMLProgram",

@@ -123,6 +123,18 @@ instalacja, gdy systemowy Python jest starszy:
 .venv/bin/python examples/train_digits.py --compiler mlx
 ```
 
+## NVIDIA GPU przez CUDA
+
+Opcjonalna wtyczka `cuda` wykonuje ten sam sześciooperacyjny IR przez CuPy.
+Nie przechodzi po cichu na CPU, a parametry i gradienty SGD pozostają w pamięci
+GPU pomiędzy krokami. Wariant zależności `ctk` dołącza potrzebne składniki
+CUDA, dlatego wystarczy zgodny sterownik NVIDIA:
+
+```bash
+python -m pip install '.[benchmark,cuda]'
+python benchmarks/compare_tinygrad_10_cases.py --device cuda --trials 3
+```
+
 ## Neural Engine Apple Silicon przez Core ML
 
 Opcjonalna wtyczka `coreml` kompiluje ten sam sześciooperacyjny IR do
@@ -218,6 +230,9 @@ nie zawiera niestabilnych progów czasowych:
 .venv/bin/python benchmarks/compare_tinygrad_10_cases.py --json
 ```
 
+Na NVIDIA/CUDA użyj `--device cuda`; domyślny tryb `metal` zachowuje
+dotychczasowe zachowanie na Apple Silicon.
+
 Skrypt `benchmarks/transformer_vs_tinygrad.py` pozostaje krótszym benchmarkiem
 samego transformera.
 
@@ -240,6 +255,27 @@ Przykładowy wynik głównego benchmarku na Apple M1 Max (`tinygrad 0.14.0`,
 To mały model, więc wynik mierzy również narzut kompilacji i Pythona. Na innych
 wersjach bibliotek oraz układach Apple proporcje mogą być inne.
 
+Na NVIDIA GeForce RTX 5070 Ti (`CuPy 14.2.0`, `tinygrad 0.14.0`, Python 3.14.2)
+pełny przebieg `--device cuda --trials 3` dał następujące mediany:
+
+| przypadek | Chomik CUDA | tinygrad CUDA |
+|---|---:|---:|
+| elementwise, 1M | **1,531 ms** | 2,893 ms |
+| reduce sum, 4M | **1,304 ms** | 1,946 ms |
+| softmax, 1024×1024 | **1,287 ms** | 2,768 ms |
+| matmul, 64×64 | **0,115 ms** | 2,391 ms |
+| matmul, 256×256 | **0,227 ms** | 2,490 ms |
+| matmul, 1024×1024 | **1,522 ms** | 3,981 ms |
+| matmul, 2048×2048 | **6,463 ms** | 10,634 ms |
+| batched matmul, 16×4×64 | **0,591 ms** | 2,998 ms |
+| trening MLP, 20 epok | **0,537 s** | 1,271 s |
+| trening transformera, 10 epok | 2,626 s | **1,765 s** |
+
+Chomik wygrał dziewięć z dziesięciu przypadków. Oba MLP osiągnęły 91,78%
+accuracy; dla transformera wynik wyniósł 77,78% dla Chomika i 78,44% dla
+tinygrad. Mikrobenchmarki obejmują transfer wejścia z NumPy na GPU oraz odczyt
+wyniku z powrotem do NumPy.
+
 ### Inference rdzenia LLM około 1B
 
 Drugi benchmark buduje decoder-only transformer core bez embeddingu,
@@ -251,10 +287,28 @@ tokenizera i LM headu. Domyślna konfiguracja ma 20 bloków, szerokość 2048,
 .venv/bin/python benchmarks/llm_1b_inference.py --json
 ```
 
+Na NVIDIA/CUDA uruchom ten sam model przez
+`python benchmarks/llm_1b_inference.py --device cuda`.
+
 Na M1 Max, FP32 i `batch=1` mediana dziesięciu rozgrzanych forwardów wyniosła
 32,83 ms dla Chomika oraz 40,38 ms dla tinygrad. Pierwszy forward trwał
 odpowiednio 0,62 s i 2,63 s. Jest to prefill syntetycznych hidden states, a nie
 autoregresywne generowanie z KV cache.
+
+Na RTX 5070 Ti ten sam benchmark FP32 (`--device cuda`) dał zgodne fingerprinty
+wyjścia i następujące wyniki:
+
+| metryka | Chomik CUDA | tinygrad CUDA |
+|---|---:|---:|
+| inicjalizacja modelu | 6,605 s | **6,101 s** |
+| pierwszy forward | **0,566 s** | 3,673 s |
+| mediana 10 rozgrzanych forwardów | **36,79 ms** | 61,69 ms |
+| peak RAM procesu | **4584,6 MiB** | 7916,5 MiB |
+| pamięć GPU raportowana przez runtime | 4131,9 MiB | **3844,4 MiB** |
+
+Rozgrzany forward Chomika był 1,677× szybszy. Model ma 1 007 169 536 losowych
+parametrów FP32 (3,752 GiB samych wag); benchmark nie zawiera embeddingu,
+tokenizera, LM headu, KV cache ani generowania tokenów.
 
 ## Pełne generowanie realnym modelem 1.1B
 

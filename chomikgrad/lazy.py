@@ -94,7 +94,12 @@ class LazyNode:
         if self.value is None:
             if not self.native_values:
                 raise RuntimeError("leaf node has no value")
-            self.value = np.array(next(iter(self.native_values.values())), copy=True)
+            backend, native = next(iter(self.native_values.items()))
+            try:
+                value = get_compiler(backend).device.to_numpy(native)
+            except KeyError:
+                value = native
+            self.value = np.array(value, copy=True)
         return self.value
 
 

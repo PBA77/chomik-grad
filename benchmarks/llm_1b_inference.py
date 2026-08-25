@@ -5,7 +5,6 @@ from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
-import resource
 import subprocess
 import sys
 import time
@@ -20,6 +19,44 @@ MIB = 1024 * 1024
 
 
 def process_peak_mib() -> float:
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        class ProcessMemoryCounters(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        counters = ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(counters)
+        get_current_process = ctypes.windll.kernel32.GetCurrentProcess
+        get_current_process.restype = wintypes.HANDLE
+        get_process_memory_info = ctypes.windll.psapi.GetProcessMemoryInfo
+        get_process_memory_info.argtypes = (
+            wintypes.HANDLE,
+            ctypes.POINTER(ProcessMemoryCounters),
+            wintypes.DWORD,
+        )
+        get_process_memory_info.restype = wintypes.BOOL
+        process = get_current_process()
+        if not get_process_memory_info(
+            process, ctypes.byref(counters), counters.cb
+        ):
+            raise ctypes.WinError()
+        return float(counters.PeakWorkingSetSize / MIB)
+
+    import resource
+
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return float(peak / MIB if sys.platform == "darwin" else peak / 1024)
 
@@ -246,11 +283,15 @@ class DecoderCore:
         return self.norm(output)
 
 
-def gpu_peak_mib(framework: str) -> float:
+def gpu_peak_mib(framework: str, device: str) -> float:
     if framework == "chomik":
-        import mlx.core as mx
+        if device == "metal":
+            import mlx.core as mx
 
-        return float(mx.get_peak_memory() / MIB)
+            return float(mx.get_peak_memory() / MIB)
+        import cupy as cp
+
+        return float(cp.get_default_memory_pool().total_bytes() / MIB)
     try:
         from tinygrad.engine.realize import GlobalCounters
 
@@ -263,12 +304,18 @@ def run_worker(arguments: argparse.Namespace) -> Dict[str, object]:
     if arguments.width % arguments.heads:
         raise ValueError("width must be divisible by heads")
     framework = arguments.worker
+    compiler = "mlx" if arguments.device == "metal" else "cuda"
     adapter = ChomikAdapter() if framework == "chomik" else TinygradAdapter()
 
     if framework == "chomik":
-        import mlx.core as mx
+        if arguments.device == "metal":
+            import mlx.core as mx
 
-        mx.reset_peak_memory()
+            mx.reset_peak_memory()
+        else:
+            import cupy as cp
+
+            cp.get_default_memory_pool().free_all_blocks()
 
     started = time.perf_counter()
     model = DecoderCore(
@@ -310,7 +357,7 @@ def run_worker(arguments: argparse.Namespace) -> Dict[str, object]:
     else:
         def forward() -> np.ndarray:
             with adapter.inference_context():
-                return model(adapter.input(input_value)).numpy(compiler="mlx")
+                return model(adapter.input(input_value)).numpy(compiler=compiler)
 
     early_times = []
     result = None
@@ -337,16 +384,16 @@ def run_worker(arguments: argparse.Namespace) -> Dict[str, object]:
         "warm_median_seconds": float(np.median(warm_times)),
         "warm_runs": arguments.warm_runs,
         "process_peak_mib": process_peak_mib(),
-        "gpu_peak_mib": gpu_peak_mib(framework),
+        "gpu_peak_mib": gpu_peak_mib(framework, arguments.device),
         "fingerprint": output_fingerprint,
     }
 
     if framework == "chomik":
         from chomikgrad import get_compiler
 
-        compiler = get_compiler("mlx")
-        if hasattr(compiler, "close"):
-            compiler.close()
+        active_compiler = get_compiler(compiler)
+        if hasattr(active_compiler, "close"):
+            active_compiler.close()
     return result_data
 
 
@@ -355,7 +402,7 @@ def run_subprocess(framework: str, arguments: argparse.Namespace) -> Dict[str, o
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     environment["PYTHONPATH"] = str(ROOT)
     if framework == "tinygrad":
-        environment["DEV"] = "METAL"
+        environment["DEV"] = arguments.device.upper()
     command = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -377,6 +424,8 @@ def run_subprocess(framework: str, arguments: argparse.Namespace) -> Dict[str, o
         str(arguments.warm_runs),
         "--seed",
         str(arguments.seed),
+        "--device",
+        arguments.device,
     ]
     completed = subprocess.run(
         command,
@@ -451,7 +500,7 @@ def print_result(result: Dict[str, object]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Benchmark a roughly 1B-parameter decoder core on Metal"
+        description="Benchmark a roughly 1B-parameter decoder core on GPU"
     )
     parser.add_argument("--layers", type=int, default=20)
     parser.add_argument("--width", type=int, default=2048)
@@ -461,6 +510,7 @@ def main() -> None:
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--warm-runs", type=int, default=10)
     parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument("--device", choices=("metal", "cuda"), default="metal")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--worker", choices=("chomik", "tinygrad"), help=argparse.SUPPRESS)
     arguments = parser.parse_args()

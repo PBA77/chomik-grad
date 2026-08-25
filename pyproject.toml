@@ -17,6 +17,9 @@ mlx = [
 coreml = [
     "coremltools>=9.0,<10; python_version >= '3.10' and platform_system == 'Darwin' and platform_machine == 'arm64'",
 ]
+cuda = [
+    "cupy-cuda13x[ctk]>=14.1,<15",
+]
 llm = [
     "huggingface-hub>=0.28",
     "ml-dtypes>=0.5",

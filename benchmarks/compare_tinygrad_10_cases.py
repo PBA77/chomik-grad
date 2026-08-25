@@ -125,6 +125,7 @@ def chomik_mlp_trial(
     test_x: np.ndarray,
     train_y: np.ndarray,
     test_y: np.ndarray,
+    compiler: str,
 ) -> Tuple[float, float]:
     from chomikgrad import Linear, ReLU, SGD, Sequential, Tensor, cross_entropy, no_grad
 
@@ -146,13 +147,13 @@ def chomik_mlp_trial(
                 train_y[indexes],
             )
             loss.backward()
-            optimizer.step(compiler="mlx")
-    model.parameters()[0].numpy(compiler="mlx")
+            optimizer.step(compiler=compiler)
+    model.parameters()[0].numpy(compiler=compiler)
     elapsed = time.perf_counter() - started
     with no_grad():
         predictions = (
             model(Tensor(test_x, copy=False))
-            .numpy(compiler="mlx")
+            .numpy(compiler=compiler)
             .argmax(axis=1)
         )
     return elapsed, float((predictions == test_y).mean())
@@ -234,7 +235,10 @@ def training_result(
     }
 
 
-def run_worker(framework: str, trials: int, repeat_scale: float) -> List[Dict[str, object]]:
+def run_worker(
+    framework: str, trials: int, repeat_scale: float, device: str
+) -> List[Dict[str, object]]:
+    compiler = "mlx" if device == "metal" else "cuda"
     results = []
     for name, arrays in micro_cases():
         repeats = max(1, round(MICRO_REPEATS[name] * repeat_scale))
@@ -245,7 +249,7 @@ def run_worker(framework: str, trials: int, repeat_scale: float) -> List[Dict[st
                 return operation(
                     name,
                     [Tensor(value, copy=False) for value in arrays],
-                ).numpy(compiler="mlx")  # type: ignore[union-attr]
+                ).numpy(compiler=compiler)  # type: ignore[union-attr]
         else:
             from tinygrad import Tensor as TinyTensor, TinyJit
 
@@ -269,7 +273,11 @@ def run_worker(framework: str, trials: int, repeat_scale: float) -> List[Dict[st
         )
 
     train_x, test_x, train_y, test_y = digits_data()
-    mlp = chomik_mlp_trial if framework == "chomik" else tinygrad_mlp_trial
+    mlp = (
+        (lambda *values: chomik_mlp_trial(*values, compiler))
+        if framework == "chomik"
+        else tinygrad_mlp_trial
+    )
     results.append(
         training_result(
             "train_mlp_20_epochs",
@@ -285,7 +293,7 @@ def run_worker(framework: str, trials: int, repeat_scale: float) -> List[Dict[st
 
     if framework == "chomik":
         transformer = lambda: benchmark_chomik(
-            "mlx", train_x, test_x, train_y, test_y, 7, 10, 64
+            compiler, train_x, test_x, train_y, test_y, 7, 10, 64
         )
     else:
         transformer = lambda: benchmark_tinygrad(
@@ -296,9 +304,9 @@ def run_worker(framework: str, trials: int, repeat_scale: float) -> List[Dict[st
     if framework == "chomik":
         from chomikgrad import get_compiler
 
-        compiler = get_compiler("mlx")
-        if hasattr(compiler, "close"):
-            compiler.close()
+        active_compiler = get_compiler(compiler)
+        if hasattr(active_compiler, "close"):
+            active_compiler.close()
     return results
 
 
@@ -307,7 +315,7 @@ def worker_command(framework: str, arguments: argparse.Namespace) -> List[Dict[s
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     environment["PYTHONPATH"] = str(ROOT)
     if framework == "tinygrad":
-        environment["DEV"] = "METAL"
+        environment["DEV"] = arguments.device.upper()
     command = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -317,6 +325,8 @@ def worker_command(framework: str, arguments: argparse.Namespace) -> List[Dict[s
         str(arguments.trials),
         "--repeat-scale",
         str(arguments.repeat_scale),
+        "--device",
+        arguments.device,
     ]
     completed = subprocess.run(
         command,
@@ -340,6 +350,8 @@ def worker_command(framework: str, arguments: argparse.Namespace) -> List[Dict[s
 def compare(
     chomik: List[Dict[str, object]],
     tinygrad: List[Dict[str, object]],
+    *,
+    accuracy_atol: float = 1e-9,
 ) -> List[Dict[str, object]]:
     if len(chomik) != 10 or len(tinygrad) != 10:
         raise RuntimeError("expected exactly ten benchmark cases")
@@ -355,7 +367,9 @@ def compare(
                 atol=2e-3,
             )
         if "accuracy" in left:
-            np.testing.assert_allclose(left["accuracy"], right["accuracy"], atol=1e-9)
+            np.testing.assert_allclose(
+                left["accuracy"], right["accuracy"], rtol=0, atol=accuracy_atol
+            )
         chomik_time = float(left["median"])
         tinygrad_time = float(right["median"])
         compared.append(
@@ -387,10 +401,11 @@ def print_table(results: List[Dict[str, object]]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compare chomik-grad and tinygrad on ten Metal workloads"
+        description="Compare chomik-grad and tinygrad on ten GPU workloads"
     )
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--repeat-scale", type=float, default=1.0)
+    parser.add_argument("--device", choices=("metal", "cuda"), default="metal")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--worker", choices=("chomik", "tinygrad"), help=argparse.SUPPRESS)
     arguments = parser.parse_args()
@@ -401,7 +416,12 @@ def main() -> None:
         print(
             RESULT_PREFIX
             + json.dumps(
-                run_worker(arguments.worker, arguments.trials, arguments.repeat_scale)
+                run_worker(
+                    arguments.worker,
+                    arguments.trials,
+                    arguments.repeat_scale,
+                    arguments.device,
+                )
             )
         )
         return
@@ -409,6 +429,7 @@ def main() -> None:
     results = compare(
         worker_command("chomik", arguments),
         worker_command("tinygrad", arguments),
+        accuracy_atol=0.01 if arguments.device == "cuda" else 1e-9,
     )
     if arguments.json:
         print(json.dumps(results, indent=2))
