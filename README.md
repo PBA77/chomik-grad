@@ -132,8 +132,14 @@ CUDA, dlatego wystarczy zgodny sterownik NVIDIA:
 
 ```bash
 python -m pip install '.[benchmark,cuda]'
+python -m pip install torch --index-url https://download.pytorch.org/whl/cu130
 python benchmarks/compare_tinygrad_10_cases.py --device cuda --trials 3
 ```
+
+Na natywnym Windows wariant `torch-compile` używa oficjalnego backendu
+`cudagraphs`, ponieważ wheel PyTorch nie zawiera Tritona. Na systemie z
+działającym Tritonem można wybrać pełny Inductor przez
+`--torch-compile-backend inductor`.
 
 ## Neural Engine Apple Silicon przez Core ML
 
@@ -219,10 +225,10 @@ python examples/train_digits_transformer.py --compiler cpu
 
 ## Benchmark względem tinygrad
 
-Główny benchmark uruchamia Chomika i tinygrad w osobnych procesach, aby ich
-runtime'y Metal nie wpływały na siebie. Obejmuje osiem operacji tensorowych,
-20 epok MLP i 10 epok transformera. Kontroluje zgodność wyników oraz accuracy;
-nie zawiera niestabilnych progów czasowych:
+Główny benchmark uruchamia Chomika, tinygrad i opcjonalne warianty PyTorch w
+osobnych procesach, aby ich runtime'y GPU nie wpływały na siebie. Obejmuje osiem
+operacji tensorowych, 20 epok MLP i 10 epok transformera. Kontroluje zgodność
+wyników oraz accuracy; nie zawiera niestabilnych progów czasowych:
 
 ```bash
 .venv/bin/python -m pip install '.[benchmark]'
@@ -255,26 +261,26 @@ Przykładowy wynik głównego benchmarku na Apple M1 Max (`tinygrad 0.14.0`,
 To mały model, więc wynik mierzy również narzut kompilacji i Pythona. Na innych
 wersjach bibliotek oraz układach Apple proporcje mogą być inne.
 
-Na NVIDIA GeForce RTX 5070 Ti (`CuPy 14.2.0`, `tinygrad 0.14.0`, Python 3.14.2)
-pełny przebieg `--device cuda --trials 3` dał następujące mediany:
+Na NVIDIA GeForce RTX 5070 Ti (`CuPy 14.2.0`, `tinygrad 0.14.0`,
+`PyTorch 2.13.0+cu130`, Python 3.14.2) pełny przebieg
+`--device cuda --trials 3` dał następujące mediany:
 
-| przypadek | Chomik CUDA | tinygrad CUDA |
-|---|---:|---:|
-| elementwise, 1M | **1,531 ms** | 2,893 ms |
-| reduce sum, 4M | **1,304 ms** | 1,946 ms |
-| softmax, 1024×1024 | **1,287 ms** | 2,768 ms |
-| matmul, 64×64 | **0,115 ms** | 2,391 ms |
-| matmul, 256×256 | **0,227 ms** | 2,490 ms |
-| matmul, 1024×1024 | **1,522 ms** | 3,981 ms |
-| matmul, 2048×2048 | **6,463 ms** | 10,634 ms |
-| batched matmul, 16×4×64 | **0,591 ms** | 2,998 ms |
-| trening MLP, 20 epok | **0,537 s** | 1,271 s |
-| trening transformera, 10 epok | 2,626 s | **1,765 s** |
+| przypadek | Chomik CUDA | tinygrad CUDA | PyTorch eager | PyTorch compile/CUDA Graphs |
+|---|---:|---:|---:|---:|
+| elementwise, 1M | 1,523 ms | 2,911 ms | 1,113 ms | **1,002 ms** |
+| reduce sum, 4M | 1,261 ms | 1,926 ms | **0,927 ms** | 1,000 ms |
+| softmax, 1024×1024 | 1,257 ms | 2,663 ms | 0,791 ms | **0,756 ms** |
+| matmul, 64×64 | 0,125 ms | 2,259 ms | **0,112 ms** | 0,177 ms |
+| matmul, 256×256 | 0,227 ms | 2,384 ms | **0,187 ms** | 0,318 ms |
+| matmul, 1024×1024 | 1,497 ms | 3,985 ms | **0,995 ms** | 1,096 ms |
+| matmul, 2048×2048 | 6,202 ms | 9,956 ms | **4,045 ms** | 4,269 ms |
+| batched matmul, 16×4×64 | 0,614 ms | 3,046 ms | **0,362 ms** | 0,445 ms |
+| trening MLP, 20 epok | 0,498 s | 1,239 s | **0,262 s** | 0,363 s |
+| trening transformera, 10 epok | 2,321 s | 1,727 s | **0,987 s** | 1,207 s |
 
-Chomik wygrał dziewięć z dziesięciu przypadków. Oba MLP osiągnęły 91,78%
-accuracy; dla transformera wynik wyniósł 77,78% dla Chomika i 78,44% dla
-tinygrad. Mikrobenchmarki obejmują transfer wejścia z NumPy na GPU oraz odczyt
-wyniku z powrotem do NumPy.
+PyTorch eager wygrał osiem przypadków, a CUDA Graphs dwa. Kontrole fingerprintów
+i accuracy przeszły dla wszystkich frameworków. Mikrobenchmarki obejmują
+transfer wejścia z NumPy na GPU oraz odczyt wyniku z powrotem do NumPy.
 
 ### Inference rdzenia LLM około 1B
 
@@ -295,20 +301,22 @@ Na M1 Max, FP32 i `batch=1` mediana dziesięciu rozgrzanych forwardów wyniosła
 odpowiednio 0,62 s i 2,63 s. Jest to prefill syntetycznych hidden states, a nie
 autoregresywne generowanie z KV cache.
 
-Na RTX 5070 Ti ten sam benchmark FP32 (`--device cuda`) dał zgodne fingerprinty
-wyjścia i następujące wyniki:
+Na RTX 5070 Ti ten sam benchmark FP32 (`--device cuda --warm-runs 30`) dał
+zgodne fingerprinty wyjścia i następujące wyniki:
 
-| metryka | Chomik CUDA | tinygrad CUDA |
-|---|---:|---:|
-| inicjalizacja modelu | 6,605 s | **6,101 s** |
-| pierwszy forward | **0,566 s** | 3,673 s |
-| mediana 10 rozgrzanych forwardów | **36,79 ms** | 61,69 ms |
-| peak RAM procesu | **4584,6 MiB** | 7916,5 MiB |
-| pamięć GPU raportowana przez runtime | 4131,9 MiB | **3844,4 MiB** |
+| metryka | Chomik CUDA | tinygrad CUDA | PyTorch eager | PyTorch compile/CUDA Graphs |
+|---|---:|---:|---:|---:|
+| inicjalizacja modelu | 6,644 s | **6,052 s** | 6,516 s | 6,480 s |
+| pierwszy forward | 0,542 s | 3,699 s | **0,156 s** | 3,372 s |
+| mediana 30 rozgrzanych forwardów | **9,69 ms** | 61,61 ms | 10,79 ms | 12,26 ms |
+| peak RAM procesu | 4583,1 MiB | 7917,4 MiB | **1048,3 MiB** | 1219,2 MiB |
+| pamięć GPU raportowana przez runtime | 3990,3 MiB | **3844,4 MiB** | 3877,1 MiB | 3877,1 MiB |
 
-Rozgrzany forward Chomika był 1,677× szybszy. Model ma 1 007 169 536 losowych
-parametrów FP32 (3,752 GiB samych wag); benchmark nie zawiera embeddingu,
-tokenizera, LM headu, KV cache ani generowania tokenów.
+Chomik wygrał rozgrzany forward: był 1,11× szybszy od PyTorch eager, 1,26× od
+CUDA Graphs i 6,36× od tinygrad. Backend kompiluje graf raz, spłaszcza projekcje
+liniowe do 2D GEMM i używa jednego kernela FP32 dla LayerNorm. Model ma
+1 007 169 536 losowych parametrów FP32 (3,752 GiB samych wag); benchmark nie
+zawiera embeddingu, tokenizera, LM headu, KV cache ani generowania tokenów.
 
 ## Pełne generowanie realnym modelem 1.1B
 

@@ -11,7 +11,6 @@ from .lazy import (
     DeviceAdapter,
     LazyNode,
     Op,
-    topological_sort,
 )
 
 
@@ -67,9 +66,56 @@ class CUDAProgram(CompiledProgram):
             self.device.evaluate(outputs)
         return outputs
 
-
 class CUDACompiler(Compiler):
     """Translate the portable six-operation IR to CuPy on an NVIDIA GPU."""
+
+    _SUPPORTED_LOWERINGS = {"layer_norm"}
+    _LAYER_NORM_SOURCE = r"""
+extern "C" __global__ void layer_norm(
+    const float* inputs,
+    const float* weight,
+    const float* bias,
+    float* outputs,
+    const int width,
+    const float epsilon
+) {
+    const int row = blockIdx.x;
+    const int thread = threadIdx.x;
+    const int offset = row * width;
+    __shared__ float values[256];
+
+    float sum = 0.0f;
+    for (int column = thread; column < width; column += blockDim.x) {
+        sum += inputs[offset + column];
+    }
+    values[thread] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (thread < stride) values[thread] += values[thread + stride];
+        __syncthreads();
+    }
+    const float mean = values[0] / width;
+
+    float squared_sum = 0.0f;
+    for (int column = thread; column < width; column += blockDim.x) {
+        const float centered = inputs[offset + column] - mean;
+        squared_sum += centered * centered;
+    }
+    values[thread] = squared_sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (thread < stride) values[thread] += values[thread + stride];
+        __syncthreads();
+    }
+    const float inverse_std = rsqrtf(values[0] / width + epsilon);
+
+    for (int column = thread; column < width; column += blockDim.x) {
+        outputs[offset + column] =
+            (inputs[offset + column] - mean) * inverse_std * weight[column]
+            + bias[column];
+    }
+}
+"""
 
     _BINARY = {
         "add": "cp.add({0}, {1})",
@@ -107,6 +153,7 @@ class CUDACompiler(Compiler):
         self._cp = cp
         self.device = CUDADeviceAdapter(cp)
         self._program_cache: Dict[object, Tuple[str, Callable[..., Any]]] = {}
+        self._layer_norm_kernel: Optional[Any] = None
 
     @property
     def cache_size(self) -> int:
@@ -126,15 +173,53 @@ class CUDACompiler(Compiler):
             node.native_values["cuda"] = native
         return native
 
-    @staticmethod
+    @classmethod
+    def _node_inputs(cls, node: LazyNode) -> Tuple[LazyNode, ...]:
+        if node.lowering is not None and node.lowering[0] in cls._SUPPORTED_LOWERINGS:
+            return node.lowering[1]
+        return node.inputs
+
+    @classmethod
+    def _topological_sort(cls, outputs: Sequence[LazyNode]) -> Tuple[LazyNode, ...]:
+        ordered = []
+        visited = set()
+
+        def visit(node: LazyNode) -> None:
+            if node in visited:
+                return
+            visited.add(node)
+            for parent in cls._node_inputs(node):
+                visit(parent)
+            ordered.append(node)
+
+        for output in outputs:
+            visit(output)
+        return tuple(ordered)
+
+    @classmethod
     def _signature(
-        nodes: Sequence[LazyNode], outputs: Sequence[LazyNode]
+        cls, nodes: Sequence[LazyNode], outputs: Sequence[LazyNode]
     ) -> object:
         indexes = {node: index for index, node in enumerate(nodes)}
         specifications = []
         for node in nodes:
             if node.op is None:
                 specifications.append((None, node.shape, node.dtype.str))
+            elif (
+                node.lowering is not None
+                and node.lowering[0] in cls._SUPPORTED_LOWERINGS
+            ):
+                kind, inputs, argument = node.lowering
+                specifications.append(
+                    (
+                        "lowering",
+                        kind,
+                        argument,
+                        node.shape,
+                        node.dtype.str,
+                        tuple(indexes[parent] for parent in inputs),
+                    )
+                )
             else:
                 specifications.append(
                     (
@@ -157,7 +242,7 @@ class CUDACompiler(Compiler):
         if any(node.op is not None for node in dynamic_inputs):
             raise ValueError("dynamic inputs must be graph leaves")
 
-        nodes = topological_sort(outputs)
+        nodes = self._topological_sort(outputs)
         leaves = tuple(node for node in nodes if node.op is None)
         requested_dynamic = set(dynamic_inputs)
         if not requested_dynamic.issubset(leaves):
@@ -179,7 +264,7 @@ class CUDACompiler(Compiler):
             if node.op is None:
                 lines.append(f"    {name} = inputs[{leaf_indexes[node]}]")
                 continue
-            args = [names[parent] for parent in node.inputs]
+            args = [names[parent] for parent in self._node_inputs(node)]
             lines.append(f"    {name} = {self._expression(node, args)}")
 
         rendered_outputs = ", ".join(names[node] for node in outputs)
@@ -191,7 +276,7 @@ class CUDACompiler(Compiler):
         namespace: Dict[str, object] = {}
         exec(
             compile(source, "<chomikgrad-cuda>", "exec"),
-            {"cp": self._cp},
+            {"cp": self._cp, "layer_norm": self._layer_norm},
             namespace,
         )
         raw_run = namespace["run"]
@@ -246,6 +331,15 @@ class CUDACompiler(Compiler):
         return parameter_nodes, gradient_nodes
 
     def _expression(self, node: LazyNode, args: Sequence[str]) -> str:
+        if node.lowering is not None and node.lowering[0] in self._SUPPORTED_LOWERINGS:
+            kind, _, argument = node.lowering
+            if kind == "layer_norm":
+                return (
+                    f"layer_norm({args[0]}, {args[1]}, {args[2]}, "
+                    f"{float(argument)!r})"
+                )
+            raise ValueError(f"unsupported CUDA lowering: {kind}")
+
         if node.op is Op.ELEMENTWISE:
             kind = str(node.arg)
             if kind in self._BINARY:
@@ -265,7 +359,50 @@ class CUDACompiler(Compiler):
         if node.op is Op.PERMUTE:
             return f"cp.transpose({args[0]}, axes={node.arg!r})"
         if node.op is Op.MATMUL:
+            left, right = node.inputs
+            if len(left.shape) > 2 and len(right.shape) == 2:
+                flattened = (-1, left.shape[-1])
+                return (
+                    f"cp.matmul(cp.reshape({args[0]}, {flattened!r}), {args[1]})"
+                    f".reshape({node.shape!r})"
+                )
             return f"cp.matmul({args[0]}, {args[1]})"
         if node.op is Op.GATHER:
             return f"cp.take({args[0]}, {args[1]}, axis=0)"
         raise ValueError(f"unsupported operation: {node.op}")
+
+    def _layer_norm(
+        self,
+        inputs: Any,
+        weight: Any,
+        bias: Any,
+        epsilon: float,
+    ) -> Any:
+        cp = self._cp
+        if (
+            inputs.dtype != cp.float32
+            or weight.dtype != cp.float32
+            or bias.dtype != cp.float32
+            or not inputs.flags.c_contiguous
+            or not weight.flags.c_contiguous
+            or not bias.flags.c_contiguous
+        ):
+            mean = cp.mean(inputs, axis=-1, keepdims=True)
+            centered = inputs - mean
+            variance = cp.mean(centered * centered, axis=-1, keepdims=True)
+            return centered / cp.sqrt(variance + epsilon) * weight + bias
+
+        if self._layer_norm_kernel is None:
+            self._layer_norm_kernel = cp.RawKernel(
+                self._LAYER_NORM_SOURCE,
+                "layer_norm",
+            )
+        output = cp.empty_like(inputs)
+        width = inputs.shape[-1]
+        rows = inputs.size // width
+        self._layer_norm_kernel(
+            (rows,),
+            (256,),
+            (inputs, weight, bias, output, np.int32(width), np.float32(epsilon)),
+        )
+        return output

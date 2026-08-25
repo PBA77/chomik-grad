@@ -83,12 +83,13 @@ def expected_parameter_count(layers: int, width: int, hidden: int) -> int:
 class ChomikAdapter:
     name = "chomik"
 
-    def __init__(self) -> None:
+    def __init__(self, *, cuda_lowerings: bool = False) -> None:
         from chomikgrad import Tensor, no_grad
 
         self.Tensor = Tensor
         self.inference_context = no_grad
         self.parameter_count = 0
+        self.cuda_lowerings = cuda_lowerings
 
     def parameter(self, value: np.ndarray) -> Any:
         self.parameter_count += value.size
@@ -107,6 +108,22 @@ class ChomikAdapter:
     @staticmethod
     def transpose_weight(value: Any) -> Any:
         return value.T
+
+    def layer_norm(
+        self,
+        output: Any,
+        inputs: Any,
+        weight: Any,
+        bias: Any,
+        epsilon: float,
+    ) -> Any:
+        if self.cuda_lowerings:
+            output._node.lowering = (
+                "layer_norm",
+                (inputs._node, weight._node, bias._node),
+                epsilon,
+            )
+        return output
 
 
 class TinygradAdapter:
@@ -136,6 +153,61 @@ class TinygradAdapter:
     @staticmethod
     def transpose_weight(value: Any) -> Any:
         return value.transpose()
+
+    @staticmethod
+    def layer_norm(
+        output: Any,
+        inputs: Any,
+        weight: Any,
+        bias: Any,
+        epsilon: float,
+    ) -> Any:
+        return output
+
+
+class TorchAdapter:
+    name = "torch"
+
+    def __init__(self) -> None:
+        try:
+            import torch
+        except ImportError as error:
+            raise ImportError(
+                "install PyTorch CUDA to run this benchmark"
+            ) from error
+        if not torch.cuda.is_available():
+            raise RuntimeError("the PyTorch benchmark requires an available CUDA GPU")
+        self._torch = torch
+        self.inference_context = torch.inference_mode
+        self.parameter_count = 0
+
+    def parameter(self, value: np.ndarray) -> Any:
+        self.parameter_count += value.size
+        return self._torch.from_numpy(value).cuda()
+
+    def constant(self, value: np.ndarray) -> Any:
+        return self._torch.from_numpy(value).cuda()
+
+    def input(self, value: np.ndarray) -> Any:
+        return self._torch.from_numpy(value).cuda()
+
+    @staticmethod
+    def mean(value: Any) -> Any:
+        return value.mean(dim=-1, keepdim=True)
+
+    @staticmethod
+    def transpose_weight(value: Any) -> Any:
+        return value.T
+
+    @staticmethod
+    def layer_norm(
+        output: Any,
+        inputs: Any,
+        weight: Any,
+        bias: Any,
+        epsilon: float,
+    ) -> Any:
+        return output
 
 
 def random_weight(
@@ -177,10 +249,18 @@ class LayerNorm:
         self.bias = adapter.parameter(np.zeros(width, dtype=np.float32))
 
     def __call__(self, inputs: Any) -> Any:
+        epsilon = 1e-5
         mean = self.adapter.mean(inputs)
         centered = inputs - mean
         variance = self.adapter.mean(centered * centered)
-        return centered / (variance + 1e-5).sqrt() * self.weight + self.bias
+        output = centered / (variance + epsilon).sqrt() * self.weight + self.bias
+        return self.adapter.layer_norm(
+            output,
+            inputs,
+            self.weight,
+            self.bias,
+            epsilon,
+        )
 
 
 class CausalAttention:
@@ -292,6 +372,10 @@ def gpu_peak_mib(framework: str, device: str) -> float:
         import cupy as cp
 
         return float(cp.get_default_memory_pool().total_bytes() / MIB)
+    if framework.startswith("torch-"):
+        import torch
+
+        return float(torch.cuda.max_memory_allocated() / MIB)
     try:
         from tinygrad.engine.realize import GlobalCounters
 
@@ -305,7 +389,12 @@ def run_worker(arguments: argparse.Namespace) -> Dict[str, object]:
         raise ValueError("width must be divisible by heads")
     framework = arguments.worker
     compiler = "mlx" if arguments.device == "metal" else "cuda"
-    adapter = ChomikAdapter() if framework == "chomik" else TinygradAdapter()
+    if framework == "chomik":
+        adapter = ChomikAdapter(cuda_lowerings=compiler == "cuda")
+    elif framework == "tinygrad":
+        adapter = TinygradAdapter()
+    else:
+        adapter = TorchAdapter()
 
     if framework == "chomik":
         if arguments.device == "metal":
@@ -316,6 +405,11 @@ def run_worker(arguments: argparse.Namespace) -> Dict[str, object]:
             import cupy as cp
 
             cp.get_default_memory_pool().free_all_blocks()
+    elif framework.startswith("torch-"):
+        import torch
+
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
 
     started = time.perf_counter()
     model = DecoderCore(
@@ -354,10 +448,41 @@ def run_worker(arguments: argparse.Namespace) -> Dict[str, object]:
 
         def forward() -> np.ndarray:
             return compiled(adapter.input(input_value)).numpy()
+    elif framework == "chomik":
+        from chomikgrad import compile_graph
+
+        input_tensor = adapter.input(input_value)
+        input_node = input_tensor._node
+        program = None
+
+        def forward() -> np.ndarray:
+            nonlocal program
+            with adapter.inference_context():
+                if program is None:
+                    output = model(input_tensor)
+                    program = compile_graph(
+                        output,
+                        compiler=compiler,
+                        dynamic_inputs=(input_tensor,),
+                    )
+                native_input = program.device.array(input_value)
+                native_output = program.run({input_node: native_input})[0]
+                return program.device.to_numpy(native_output)
     else:
+        from benchmarks.transformer_vs_tinygrad import compile_torch
+
+        def raw_forward(inputs: Any) -> Any:
+            return model(inputs)
+
+        selected = (
+            compile_torch(raw_forward, arguments.torch_compile_backend)
+            if framework == "torch-compile"
+            else raw_forward
+        )
+
         def forward() -> np.ndarray:
             with adapter.inference_context():
-                return model(adapter.input(input_value)).numpy(compiler=compiler)
+                return selected(adapter.input(input_value)).cpu().numpy()
 
     early_times = []
     result = None
@@ -394,6 +519,10 @@ def run_worker(arguments: argparse.Namespace) -> Dict[str, object]:
         active_compiler = get_compiler(compiler)
         if hasattr(active_compiler, "close"):
             active_compiler.close()
+    elif framework.startswith("torch-"):
+        import torch
+
+        torch.cuda.synchronize()
     return result_data
 
 
@@ -426,6 +555,8 @@ def run_subprocess(framework: str, arguments: argparse.Namespace) -> Dict[str, o
         str(arguments.seed),
         "--device",
         arguments.device,
+        "--torch-compile-backend",
+        arguments.torch_compile_backend,
     ]
     completed = subprocess.run(
         command,
@@ -447,16 +578,24 @@ def run_subprocess(framework: str, arguments: argparse.Namespace) -> Dict[str, o
 
 
 def compare(arguments: argparse.Namespace) -> Dict[str, object]:
-    chomik = run_subprocess("chomik", arguments)
-    tinygrad = run_subprocess("tinygrad", arguments)
-    if chomik["parameters"] != tinygrad["parameters"]:
-        raise RuntimeError("frameworks built different parameter counts")
-    np.testing.assert_allclose(
-        chomik["fingerprint"],
-        tinygrad["fingerprint"],
-        rtol=5e-2,
-        atol=5e-2,
-    )
+    frameworks = ["chomik", "tinygrad"]
+    if arguments.device == "cuda":
+        frameworks.extend(("torch-eager", "torch-compile"))
+    results = {
+        framework: run_subprocess(framework, arguments)
+        for framework in frameworks
+    }
+    reference = results["chomik"]
+    for framework, candidate in results.items():
+        if reference["parameters"] != candidate["parameters"]:
+            raise RuntimeError("frameworks built different parameter counts")
+        if framework != "chomik":
+            np.testing.assert_allclose(
+                reference["fingerprint"],
+                candidate["fingerprint"],
+                rtol=5e-2,
+                atol=5e-2,
+            )
     return {
         "configuration": {
             "layers": arguments.layers,
@@ -465,18 +604,20 @@ def compare(arguments: argparse.Namespace) -> Dict[str, object]:
             "hidden": arguments.hidden,
             "sequence": arguments.sequence,
             "batch": arguments.batch,
+            "torch_compile_backend": arguments.torch_compile_backend,
         },
-        "chomik": chomik,
-        "tinygrad": tinygrad,
-        "warm_speed_ratio": float(tinygrad["warm_median_seconds"])
-        / float(chomik["warm_median_seconds"]),
+        "frameworks": results,
+        "winner": min(
+            results,
+            key=lambda name: float(results[name]["warm_median_seconds"]),
+        ),
     }
 
 
 def print_result(result: Dict[str, object]) -> None:
     configuration = result["configuration"]
-    chomik = result["chomik"]
-    tinygrad = result["tinygrad"]
+    frameworks = result["frameworks"]
+    chomik = frameworks["chomik"]
     print(
         "configuration "
         f"layers={configuration['layers']} width={configuration['width']} "
@@ -488,14 +629,14 @@ def print_result(result: Dict[str, object]) -> None:
         f"fp32_parameter_gib={chomik['parameter_gib_fp32']:.3f}"
     )
     print("framework,init_s,first_s,capture_s,warm_s,process_peak_mib,gpu_peak_mib")
-    for framework in (chomik, tinygrad):
+    for framework in frameworks.values():
         print(
             f"{framework['framework']},{framework['initialization_seconds']:.6f},"
             f"{framework['first_seconds']:.6f},{framework['capture_seconds']:.6f},"
             f"{framework['warm_median_seconds']:.6f},"
             f"{framework['process_peak_mib']:.1f},{framework['gpu_peak_mib']:.1f}"
         )
-    print(f"tinygrad_over_chomik_warm={result['warm_speed_ratio']:.3f}x")
+    print(f"warm_winner={result['winner']}")
 
 
 def main() -> None:
@@ -511,8 +652,17 @@ def main() -> None:
     parser.add_argument("--warm-runs", type=int, default=10)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--device", choices=("metal", "cuda"), default="metal")
+    parser.add_argument(
+        "--torch-compile-backend",
+        choices=("cudagraphs", "inductor"),
+        default="cudagraphs",
+    )
     parser.add_argument("--json", action="store_true")
-    parser.add_argument("--worker", choices=("chomik", "tinygrad"), help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--worker",
+        choices=("chomik", "tinygrad", "torch-eager", "torch-compile"),
+        help=argparse.SUPPRESS,
+    )
     arguments = parser.parse_args()
     positive = (
         arguments.layers,

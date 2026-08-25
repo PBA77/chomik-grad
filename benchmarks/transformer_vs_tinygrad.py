@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import time
-from typing import Iterator, List, Tuple
+from typing import Any, Callable, Iterator, List, Tuple
 
 import numpy as np
 from sklearn.datasets import load_digits
@@ -159,6 +159,106 @@ class TinyDigitsTransformer:
         return self.classifier(self.norm(encoded).mean(axis=1))
 
 
+class TorchLinear:
+    def __init__(self, values: Iterator[np.ndarray], parameters: List[Any]) -> None:
+        import torch
+
+        self.weight = torch.from_numpy(next(values)).cuda().requires_grad_()
+        self.bias = torch.from_numpy(next(values)).cuda().requires_grad_()
+        parameters.extend((self.weight, self.bias))
+
+    def __call__(self, inputs: Any) -> Any:
+        return inputs @ self.weight.T + self.bias
+
+
+class TorchLayerNorm:
+    def __init__(self, values: Iterator[np.ndarray], parameters: List[Any]) -> None:
+        import torch
+
+        self.weight = torch.from_numpy(next(values)).cuda().requires_grad_()
+        self.bias = torch.from_numpy(next(values)).cuda().requires_grad_()
+        parameters.extend((self.weight, self.bias))
+
+    def __call__(self, inputs: Any) -> Any:
+        mean = inputs.mean(dim=-1, keepdim=True)
+        centered = inputs - mean
+        variance = (centered * centered).mean(dim=-1, keepdim=True)
+        return centered / (variance + 1e-5).sqrt() * self.weight + self.bias
+
+
+class TorchAttention:
+    def __init__(self, values: Iterator[np.ndarray], parameters: List[Any]) -> None:
+        self.query = TorchLinear(values, parameters)
+        self.key = TorchLinear(values, parameters)
+        self.value = TorchLinear(values, parameters)
+        self.output = TorchLinear(values, parameters)
+
+    @staticmethod
+    def split_heads(inputs: Any) -> Any:
+        batch, tokens, _ = inputs.shape
+        return inputs.reshape(batch, tokens, 4, 8).permute(0, 2, 1, 3)
+
+    def __call__(self, inputs: Any) -> Any:
+        query = self.split_heads(self.query(inputs))
+        key = self.split_heads(self.key(inputs))
+        value = self.split_heads(self.value(inputs))
+        scores = (query @ key.transpose(-2, -1)) / np.sqrt(8)
+        attended = scores.softmax(dim=-1) @ value
+        batch, _, tokens, _ = attended.shape
+        merged = attended.permute(0, 2, 1, 3).reshape(batch, tokens, 32)
+        return self.output(merged)
+
+
+class TorchBlock:
+    def __init__(self, values: Iterator[np.ndarray], parameters: List[Any]) -> None:
+        self.norm1 = TorchLayerNorm(values, parameters)
+        self.attention = TorchAttention(values, parameters)
+        self.norm2 = TorchLayerNorm(values, parameters)
+        self.linear1 = TorchLinear(values, parameters)
+        self.linear2 = TorchLinear(values, parameters)
+
+    def __call__(self, inputs: Any) -> Any:
+        attended = inputs + self.attention(self.norm1(inputs))
+        return attended + self.linear2(self.linear1(self.norm2(attended)).relu())
+
+
+class TorchDigitsTransformer:
+    def __init__(self, arrays: List[np.ndarray]) -> None:
+        import torch
+
+        values = iter(arrays)
+        self.parameters: List[Any] = []
+        self.embedding = TorchLinear(values, self.parameters)
+        self.position = torch.from_numpy(next(values)).cuda().requires_grad_()
+        self.parameters.append(self.position)
+        self.blocks = [
+            TorchBlock(values, self.parameters),
+            TorchBlock(values, self.parameters),
+        ]
+        self.norm = TorchLayerNorm(values, self.parameters)
+        self.classifier = TorchLinear(values, self.parameters)
+        try:
+            next(values)
+        except StopIteration:
+            return
+        raise RuntimeError("unused reference parameter")
+
+    def __call__(self, inputs: Any) -> Any:
+        encoded = self.embedding(inputs) + self.position
+        for block in self.blocks:
+            encoded = block(encoded)
+        return self.classifier(self.norm(encoded).mean(dim=1))
+
+
+def compile_torch(function: Callable[..., Any], backend: str) -> Callable[..., Any]:
+    import torch
+
+    options: dict[str, Any] = {"backend": backend, "fullgraph": True}
+    if backend == "inductor":
+        options["mode"] = "reduce-overhead"
+    return torch.compile(function, **options)
+
+
 def benchmark_tinygrad(
     train_x: np.ndarray,
     test_x: np.ndarray,
@@ -214,9 +314,72 @@ def benchmark_tinygrad(
     return elapsed, float((predictions == test_y).mean())
 
 
+def benchmark_torch(
+    train_x: np.ndarray,
+    test_x: np.ndarray,
+    train_y: np.ndarray,
+    test_y: np.ndarray,
+    seed: int,
+    epochs: int,
+    batch_size: int,
+    *,
+    compiled: bool,
+    compile_backend: str,
+) -> Tuple[float, float]:
+    try:
+        import torch
+    except ImportError as error:
+        raise SystemExit("install PyTorch CUDA to run this benchmark") from error
+    if not torch.cuda.is_available():
+        raise RuntimeError("the PyTorch benchmark requires an available CUDA GPU")
+
+    rng = np.random.default_rng(seed)
+    reference = DigitsTransformer(rng)
+    arrays = [parameter.numpy().copy() for parameter in reference.parameters()]
+    model = TorchDigitsTransformer(arrays)
+    optimizer = torch.optim.SGD(model.parameters, lr=0.03)
+
+    def raw_forward(inputs: Any) -> Any:
+        return model(inputs)
+
+    def raw_tail_forward(inputs: Any) -> Any:
+        return model(inputs)
+
+    if compiled:
+        forward = compile_torch(raw_forward, compile_backend)
+        tail_forward = compile_torch(raw_tail_forward, compile_backend)
+    else:
+        forward = raw_forward
+        tail_forward = raw_forward
+    started = time.perf_counter()
+    for _ in range(epochs):
+        order = rng.permutation(len(train_x))
+        for start in range(0, len(order), batch_size):
+            indexes = order[start : start + batch_size]
+            one_hot = np.zeros((len(indexes), 10), dtype=np.float32)
+            one_hot[np.arange(len(indexes)), train_y[indexes]] = 1
+            inputs = torch.from_numpy(
+                train_x[indexes].reshape(-1, 8, 8)
+            ).cuda()
+            targets = torch.from_numpy(one_hot).cuda()
+            optimizer.zero_grad(set_to_none=True)
+            selected = forward if len(indexes) == batch_size else tail_forward
+            logits = selected(inputs)
+            loss = -(logits.log_softmax(dim=1) * targets).sum() / inputs.shape[0]
+            loss.backward()
+            optimizer.step()
+    torch.cuda.synchronize()
+    elapsed = time.perf_counter() - started
+
+    with torch.no_grad():
+        inputs = torch.from_numpy(test_x.reshape(-1, 8, 8)).cuda()
+        predictions = raw_forward(inputs).argmax(dim=1).cpu().numpy()
+    return elapsed, float((predictions == test_y).mean())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Compare identical digits Transformers in chomik-grad and tinygrad"
+        description="Compare identical digits Transformers across GPU frameworks"
     )
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--epochs", type=int, default=10)
@@ -225,8 +388,20 @@ def main() -> None:
     parser.add_argument(
         "--frameworks",
         nargs="+",
-        choices=("chomik-cpu", "chomik-mlx", "tinygrad"),
+        choices=(
+            "chomik-cpu",
+            "chomik-mlx",
+            "chomik-cuda",
+            "tinygrad",
+            "torch-eager",
+            "torch-compile",
+        ),
         default=("chomik-cpu", "chomik-mlx", "tinygrad"),
+    )
+    parser.add_argument(
+        "--torch-compile-backend",
+        choices=("cudagraphs", "inductor"),
+        default="cudagraphs",
     )
     arguments = parser.parse_args()
     train_x, test_x, train_y, test_y = load_data(arguments.seed)
@@ -244,6 +419,18 @@ def main() -> None:
                     arguments.seed,
                     arguments.epochs,
                     arguments.batch_size,
+                )
+            elif framework.startswith("torch-"):
+                elapsed, accuracy = benchmark_torch(
+                    train_x,
+                    test_x,
+                    train_y,
+                    test_y,
+                    arguments.seed,
+                    arguments.epochs,
+                    arguments.batch_size,
+                    compiled=framework == "torch-compile",
+                    compile_backend=arguments.torch_compile_backend,
                 )
             else:
                 elapsed, accuracy = benchmark_chomik(
