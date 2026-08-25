@@ -12,6 +12,12 @@ from chomikgrad import (
     cross_entropy,
     get_compiler,
 )
+from chomikgrad.llama import (
+    LlamaConfig,
+    LlamaForCausalLM,
+    position_selector,
+    required_weight_shapes,
+)
 
 
 MLX_INSTALLED = importlib.util.find_spec("mlx") is not None
@@ -26,7 +32,7 @@ class MLXBackendTests(unittest.TestCase):
             self.skipTest("Metal GPU is not available")
         self.mx = mx
 
-    def test_all_five_ir_operations_match_cpu_on_gpu(self) -> None:
+    def test_six_ir_operations_match_cpu_on_gpu(self) -> None:
         left = Tensor(
             [[1.0, -2.0, 0.5], [3.0, 4.0, -1.0]], dtype=np.float32
         )
@@ -49,7 +55,18 @@ class MLXBackendTests(unittest.TestCase):
         self.assertIn("mx.matmul", program.source)
         self.assertIn("mx.transpose", program.source)
         self.assertGreater(self.mx.get_peak_memory(), 0)
-        self.assertEqual(len(Op), 5)
+        self.assertEqual(len(Op), 6)
+
+        table = Tensor(
+            [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=np.float32
+        )
+        indices = Tensor(np.array([[2, 0]], dtype=np.int32), copy=False)
+        gathered = table.gather(indices)
+        gather_program = compile_graph(gathered, compiler="mlx")
+        self.assertIn("mx.take", gather_program.source)
+        np.testing.assert_allclose(
+            gather_program()[0], [[[5.0, 6.0], [1.0, 2.0]]]
+        )
 
     def test_lazy_autograd_graph_matches_cpu(self) -> None:
         raw = np.array([[2.0, -1.0, 0.5], [0.0, 1.0, -0.5]], dtype=np.float32)
@@ -70,9 +87,75 @@ class MLXBackendTests(unittest.TestCase):
     def test_native_program_can_defer_synchronization(self) -> None:
         result = Tensor([1.0, -2.0], dtype=np.float32).relu() + 0.5
         program = compile_graph(result, compiler="mlx")
-        native_result = program.run_native(evaluate=False)[0]
+        native_result = program.run(synchronize=False)[0]
         self.mx.eval(native_result)
         np.testing.assert_allclose(np.array(native_result), [1.5, 0.5])
+
+    def test_native_program_can_replace_a_dynamic_input(self) -> None:
+        source = Tensor([1.0, 2.0], dtype=np.float32)
+        program = compile_graph(
+            source * 2.0,
+            compiler="mlx",
+            dynamic_inputs=(source,),
+        )
+        replacement = self.mx.array([3.0, 4.0])
+        native_result = program.run(
+            {source._node: replacement}, synchronize=True
+        )[0]
+
+        np.testing.assert_allclose(np.array(native_result), [6.0, 8.0])
+        np.testing.assert_allclose(program()[0], [2.0, 4.0])
+        self.assertEqual(program.inputs, (source._node,))
+        self.assertIs(program.device, get_compiler("mlx").device)
+        self.assertEqual(program.device.argmax(native_result), 1)
+        np.testing.assert_array_equal(
+            program.device.argmax_last_axis(native_result), 1
+        )
+
+        compatibility_result = program.run_native(
+            input_values={source._node: replacement}
+        )[0]
+        np.testing.assert_allclose(np.array(compatibility_result), [6.0, 8.0])
+
+    def test_llama_lowerings_match_portable_cpu_graph(self) -> None:
+        config = LlamaConfig(
+            vocab_size=8,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            max_position_embeddings=8,
+        )
+        rng = np.random.default_rng(23)
+        weights = {
+            name: Tensor(
+                np.ones(shape, dtype=np.float32)
+                if "norm.weight" in name
+                else rng.normal(0, 0.05, shape).astype(np.float32)
+            )
+            for name, shape in required_weight_shapes(config).items()
+        }
+        model = LlamaForCausalLM(
+            config, weights, sequence_length=3, dtype=np.float32
+        )
+        output = model(
+            Tensor(np.array([[1, 3, 4]], dtype=np.int32), copy=False),
+            Tensor(position_selector(2, 3, dtype=np.float32), copy=False),
+        )
+
+        program = compile_graph(output, compiler="mlx")
+        self.assertIn("mx.take", program.source)
+        self.assertIn("mx.fast.rms_norm", program.source)
+        self.assertIn("mx.fast.rope", program.source)
+        self.assertIn("mx.fast.scaled_dot_product_attention", program.source)
+        self.assertNotIn("mx.sqrt", program.source)
+        np.testing.assert_allclose(
+            program()[0],
+            output.numpy(compiler="cpu"),
+            rtol=2e-4,
+            atol=2e-5,
+        )
 
     def test_copy_false_observes_mutations_across_mlx_calls(self) -> None:
         source = np.array([1.0, 2.0], dtype=np.float32)

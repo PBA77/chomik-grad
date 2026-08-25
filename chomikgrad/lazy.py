@@ -3,7 +3,17 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
+from pathlib import Path
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 
@@ -20,6 +30,7 @@ class Op(Enum):
     RESHAPE = "reshape"
     PERMUTE = "permute"
     MATMUL = "matmul"
+    GATHER = "gather"
 
 
 class LazyNode:
@@ -32,6 +43,7 @@ class LazyNode:
         "value",
         "native_values",
         "cache_native",
+        "lowering",
     )
 
     def __init__(
@@ -44,6 +56,7 @@ class LazyNode:
         value: Optional[np.ndarray] = None,
         native_values: Optional[Dict[str, object]] = None,
         cache_native: bool = True,
+        lowering: Optional[Tuple[str, Tuple["LazyNode", ...], object]] = None,
     ) -> None:
         self.op = op
         self.inputs = tuple(inputs)
@@ -53,6 +66,7 @@ class LazyNode:
         self.value = value
         self.native_values = native_values or {}
         self.cache_native = cache_native
+        self.lowering = lowering
 
     @classmethod
     def leaf(cls, value: np.ndarray, *, cache_native: bool = True) -> "LazyNode":
@@ -84,19 +98,82 @@ class LazyNode:
         return self.value
 
 
-class CompiledProgram(ABC):
-    source: str
+class DeviceAdapter(ABC):
+    """Small runtime boundary shared by compiled device backends."""
+
+    name: str
 
     @abstractmethod
-    def __call__(self) -> Tuple[np.ndarray, ...]:
+    def array(self, value: object) -> object:
         raise NotImplementedError
+
+    @abstractmethod
+    def evaluate(self, values: Sequence[object]) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def synchronize(self) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def to_numpy(self, value: object) -> np.ndarray:
+        raise NotImplementedError
+
+    @abstractmethod
+    def argmax(self, value: object) -> int:
+        raise NotImplementedError
+
+    def argmax_last_axis(self, value: object) -> np.ndarray:
+        """Return device results while keeping argmax outside the tensor IR."""
+        return np.asarray(self.to_numpy(value)).argmax(axis=-1)
+
+    @abstractmethod
+    def dtype(self, value: object) -> np.dtype:
+        raise NotImplementedError
+
+    def load_safetensors(
+        self, path: Path, *, dtype: Optional[np.dtype] = None
+    ) -> Mapping[str, object]:
+        raise NotImplementedError(
+            f"the {self.name!r} device does not support safetensors loading"
+        )
+
+    def reset_peak_memory(self) -> None:
+        pass
+
+    def peak_memory_bytes(self) -> Optional[int]:
+        return None
+
+
+class CompiledProgram(ABC):
+    source: str
+    device: DeviceAdapter
+
+    @abstractmethod
+    def run(
+        self,
+        bindings: Optional[Mapping[LazyNode, object]] = None,
+        *,
+        synchronize: bool = False,
+    ) -> Tuple[object, ...]:
+        raise NotImplementedError
+
+    def __call__(self) -> Tuple[np.ndarray, ...]:
+        outputs = self.run(synchronize=True)
+        return tuple(self.device.to_numpy(output) for output in outputs)
 
 
 class Compiler(ABC):
     """A plugin translating lazy nodes into an executable program."""
 
+    device: DeviceAdapter
+
     @abstractmethod
-    def compile(self, outputs: Sequence[LazyNode]) -> CompiledProgram:
+    def compile(
+        self,
+        outputs: Sequence[LazyNode],
+        dynamic_inputs: Sequence[LazyNode] = (),
+    ) -> CompiledProgram:
         raise NotImplementedError
 
     def update_parameters(
@@ -108,7 +185,9 @@ class Compiler(ABC):
         return None
 
 
-def topological_sort(outputs: Iterable[LazyNode]) -> Tuple[LazyNode, ...]:
+def topological_sort(
+    outputs: Iterable[LazyNode], *, use_lowerings: bool = False
+) -> Tuple[LazyNode, ...]:
     ordered = []
     visited = set()
 
@@ -116,7 +195,12 @@ def topological_sort(outputs: Iterable[LazyNode]) -> Tuple[LazyNode, ...]:
         if node in visited:
             return
         visited.add(node)
-        for parent in node.inputs:
+        parents = (
+            node.lowering[1]
+            if use_lowerings and node.lowering is not None
+            else node.inputs
+        )
+        for parent in parents:
             visit(parent)
         ordered.append(node)
 
@@ -130,10 +214,48 @@ class NumpyProgram(CompiledProgram):
     source: str
     inputs: Tuple[LazyNode, ...]
     _run: Callable[[Sequence[np.ndarray]], Tuple[np.ndarray, ...]]
+    device: DeviceAdapter
 
-    def __call__(self) -> Tuple[np.ndarray, ...]:
-        values = [node.numpy_value() for node in self.inputs]
-        return tuple(np.asarray(value) for value in self._run(values))
+    def run(
+        self,
+        bindings: Optional[Mapping[LazyNode, object]] = None,
+        *,
+        synchronize: bool = False,
+    ) -> Tuple[object, ...]:
+        replacements = bindings or {}
+        values = [
+            np.asarray(replacements[node])
+            if node in replacements
+            else node.numpy_value()
+            for node in self.inputs
+        ]
+        outputs = tuple(np.asarray(value) for value in self._run(values))
+        if synchronize:
+            self.device.evaluate(outputs)
+        return outputs
+
+
+class NumpyDeviceAdapter(DeviceAdapter):
+    name = "cpu"
+
+    def array(self, value: object) -> np.ndarray:
+        return np.asarray(value)
+
+    def evaluate(self, values: Sequence[object]) -> None:
+        for value in values:
+            np.asarray(value)
+
+    def synchronize(self) -> None:
+        pass
+
+    def to_numpy(self, value: object) -> np.ndarray:
+        return np.asarray(value)
+
+    def argmax(self, value: object) -> int:
+        return int(np.asarray(value).argmax())
+
+    def dtype(self, value: object) -> np.dtype:
+        return np.asarray(value).dtype
 
 
 class NumpyCompiler(Compiler):
@@ -155,7 +277,14 @@ class NumpyCompiler(Compiler):
         "step": "np.greater({0}, 0).astype({0}.dtype, copy=False)",
     }
 
-    def compile(self, outputs: Sequence[LazyNode]) -> NumpyProgram:
+    def __init__(self) -> None:
+        self.device = NumpyDeviceAdapter()
+
+    def compile(
+        self,
+        outputs: Sequence[LazyNode],
+        dynamic_inputs: Sequence[LazyNode] = (),
+    ) -> NumpyProgram:
         if not outputs:
             raise ValueError("at least one output is required")
 
@@ -183,7 +312,9 @@ class NumpyCompiler(Compiler):
 
         namespace: Dict[str, object] = {}
         exec(compile(source, "<chomikgrad-numpy>", "exec"), {"np": np}, namespace)
-        return NumpyProgram(source, leaves, namespace["run"])  # type: ignore[arg-type]
+        return NumpyProgram(  # type: ignore[arg-type]
+            source, leaves, namespace["run"], self.device
+        )
 
     def _expression(self, node: LazyNode, args: Sequence[str]) -> str:
         if node.op is Op.ELEMENTWISE:
@@ -208,6 +339,9 @@ class NumpyCompiler(Compiler):
 
         if node.op is Op.MATMUL:
             return f"np.matmul({args[0]}, {args[1]})"
+
+        if node.op is Op.GATHER:
+            return f"np.take({args[0]}, {args[1]}, axis=0)"
 
         raise ValueError(f"unsupported operation: {node.op}")
 

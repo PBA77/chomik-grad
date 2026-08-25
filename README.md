@@ -5,13 +5,14 @@ kompilatory i mały zestaw narzędzi do uczenia sieci. Runtime wymaga tylko NumP
 
 ## Architektura
 
-Cały IR ma pięć operacji:
+Cały IR ma sześć operacji:
 
 1. `ELEMENTWISE` — m.in. add, mul, exp, log, sqrt i ReLU jako warianty jednej operacji,
 2. `REDUCE` — sum/max,
 3. `RESHAPE`,
 4. `PERMUTE`,
-5. `MATMUL`.
+5. `MATMUL`,
+6. `GATHER` — indeksowanie pierwszej osi, używane m.in. przez embeddingi.
 
 `softmax` i `log_softmax` są stabilnymi numerycznie kompozycjami tych
 prymitywów. Nie dodają kolejnej instrukcji ani specjalnego przypadku w backendach.
@@ -40,30 +41,65 @@ niemutowanych tablic można jawnie użyć `Tensor(np_array, copy=False)`, aby
 pominąć dodatkową kopię w RAM. Backend MLX nie cache'uje wtedy wejścia i
 zauważa późniejsze zmiany źródłowej tablicy.
 
-## Wtyczka kompilatora
+## Wtyczka kompilatora i urządzenia
 
-Wtyczka implementuje jedną metodę. Dostaje wyjściowe `LazyNode` i zwraca
-wywoływalny `CompiledProgram`:
+Kompilator dostaje wyjściowe `LazyNode` i zwraca `CompiledProgram`. Każdy
+program udostępnia ten sam kontrakt `run(bindings, synchronize=False)`, więc
+można podmieniać wartości liści bez budowania grafu od nowa:
 
 ```python
-from chomikgrad import Compiler, register_compiler, set_default_compiler
+native_outputs = program.run(
+    {input_node: program.device.array(new_value)},
+    synchronize=False,
+)
+```
+
+Dla inferencji można dodatkowo wskazać liście, które rzeczywiście zmieniają
+się między wywołaniami. Backend może wtedy przechwycić wagi i pozostałe stałe:
+
+```python
+program = compile_graph(
+    output,
+    compiler="mlx",
+    dynamic_inputs=(tokens, position, key_cache, value_cache),
+)
+```
+
+MLX używa tej informacji wyłącznie do specjalizacji programu inferencyjnego.
+Zwykłe `compile_graph(...)`, autograd i trening nadal przekazują wszystkie
+liście dynamicznie, więc aktualizacja parametrów nie wymaga rekompilacji.
+
+Wtyczka ma parę małych elementów:
+
+```python
+from chomikgrad import Compiler, DeviceAdapter, register_compiler
+
+class MyDevice(DeviceAdapter):
+    # array, evaluate, synchronize, to_numpy, argmax i dtype
+    ...
 
 class MyCompiler(Compiler):
+    device = MyDevice()
+
     def compile(self, outputs):
-        # Przejdź inputs każdego LazyNode i obsłuż pięć wartości Op.
-        # Zwrócony program ma zwracać tuple[np.ndarray, ...].
+        # Przejdź inputs każdego LazyNode i obsłuż sześć wartości Op.
+        # Zwróć CompiledProgram korzystający z tego samego device.
         ...
 
 register_compiler("my-device", MyCompiler)
-set_default_compiler("my-device")
 ```
 
-Kompilator można też wskazać dla pojedynczej realizacji:
+`DeviceAdapter` oddziela tworzenie natywnych tablic, synchronizację, odczyt do
+NumPy, `argmax`, mapowanie dtype i opcjonalne ładowanie safetensors od kompilacji
+IR. Dzięki temu przyszły backend CUDA albo Vulkan może użyć tego samego runtime'u
+inferencji; nadal musi dostarczyć własne sześć loweringów i ewentualne szybkie
+kernele RMSNorm/RoPE/attention. Kompilator można wskazać dla pojedynczej
+realizacji:
 `tensor.numpy(compiler="my-device")`.
 
 ## GPU Apple Silicon przez MLX
 
-Opcjonalna wtyczka `mlx` tłumaczy dokładnie ten sam pięciooperacyjny IR na
+Opcjonalna wtyczka `mlx` tłumaczy dokładnie ten sam sześciooperacyjny IR na
 `mlx.core` i jawnie wykonuje graf na urządzeniu Metal GPU. Brak MLX albo Metal
 kończy się czytelnym błędem — backend nie przechodzi po cichu na CPU.
 
@@ -72,6 +108,11 @@ krokami. Strukturalnie identyczne grafy korzystają z cache oraz `mx.compile`, a
 SGD oblicza gradienty i aktualizuje parametry przy jednej synchronizacji GPU,
 bez kopiowania ich przez NumPy. Transfer do RAM-u
 następuje dopiero po jawnym `numpy()`, `item()` albo użyciu kompilatora `cpu`.
+MLX implementuje wspólne `CompiledProgram.run(...)` i `DeviceAdapter`, zamiast
+wymagać specjalnego API od generatora. Pozwala to utrzymywać jeden program
+autoregresywnego decode i wiązać do niego nowe tokeny oraz cache K/V. Po
+wybraniu szybkiego loweringu kompilator odcina jego nieużywane przenośne
+rozwinięcie; pełny fallback pozostaje dostępny dla CPU i innych backendów.
 
 MLX wymaga Apple Silicon, macOS 14+ i natywnego Pythona 3.10+. Przykładowa
 instalacja, gdy systemowy Python jest starszy:
@@ -81,6 +122,63 @@ instalacja, gdy systemowy Python jest starszy:
 .venv/bin/python -m pip install '.[demo,mlx]'
 .venv/bin/python examples/train_digits.py --compiler mlx
 ```
+
+## Neural Engine Apple Silicon przez Core ML
+
+Opcjonalna wtyczka `coreml` kompiluje ten sam sześciooperacyjny IR do
+`ML Program` w FP16 i ładuje go z `CPU_AND_NE`. Apple nie udostępnia
+bezpośredniego API obliczeniowego ANE ani trybu `NE_ONLY`: Core ML podejmuje
+ostateczną decyzję osobno dla każdej operacji. `CoreMLProgram.compute_plan_summary()`
+odczytuje plan skompilowanego modelu, dlatego testy nie traktują samej flagi
+`CPU_AND_NE` jako dowodu użycia Neural Engine.
+
+Backend jest przeznaczony wyłącznie do inferencji. Przechwytuje stałe wagi,
+rozpoznaje `x @ weight.T` jako Core ML `linear` i dzieli modele przekraczające
+1 GiB stałych na segmenty. Bez segmentacji monolityczny TinyLlama 1.1B działał
+poprawnie, ale Core ML na M1 przypisał cały graf do CPU. Trzy segmenty zachowują
+identyczny wynik i przywracają wykonanie większości grafu na ANE.
+
+```bash
+.venv/bin/python -m pip install '.[coreml,llm]'
+.venv/bin/python examples/generate_tinyllama.py \
+  --compiler coreml --dtype float16 --max-new-tokens 8
+```
+
+Ograniczenia są celowo jawne:
+
+- tylko FP16, macOS 15+ i Apple Silicon,
+- inference ze stałymi kształtami; brak autogradu i treningu,
+- wywołanie `MLModel.predict` jest synchroniczne i przechodzi przez tablice
+  NumPy na granicach segmentów,
+- pojedynczy token przy `batch=1` nie wykorzystuje ANE tak efektywnie jak GPU.
+
+Sportowe porównanie używa dokładnie tych samych wag, aktywacji, cache K/V,
+implementacji Chomika, promptu i tokenów w FP16:
+
+```bash
+.venv/bin/python benchmarks/tinyllama_coreml_vs_mlx.py --trials 3
+```
+
+Przykładowy wynik na Apple M1 Max (`coremltools 9.0`, `MLX 0.32.1`, 28 tokenów
+promptu i osiem tokenów odpowiedzi):
+
+| TinyLlama 1.1B FP16 | Core ML / ANE | MLX / GPU |
+|---|---:|---:|
+| pierwszy token, wraz z kompilacją | 42,879 s | **0,061 s** |
+| pełna odpowiedź, wraz z kompilacją | 71,836 s | **0,140 s** |
+| pierwszy token po rozgrzaniu | 0,793 s | **0,021 s** |
+| rozgrzany decode | 15,0 tokenu/s | **114,5 tokenu/s** |
+| pełna odpowiedź po rozgrzaniu | 1,424 s | **0,083 s** |
+
+Compute Plan wskazał dla prefillu 1377 operacji preferujących Neural Engine i
+185 CPU, a dla decode odpowiednio 1235 i 218. Wszystkie osiem identyfikatorów
+tokenów pozostało identycznych. Na M1 ANE jest więc działającym backendem
+badawczym, ale nie jest konkurencyjny czasowo wobec
+Metal GPU dla autoregresywnego LLM `batch=1`.
+
+Dokumentacja Apple: [wybór CPU i Neural Engine](https://developer.apple.com/documentation/coreml/mlcomputeunits/cpuandneuralengine),
+[Compute Plan](https://apple.github.io/coremltools/docs-guides/source/mlmodel-utilities.html)
+i [wykonanie FP16](https://apple.github.io/coremltools/docs-guides/source/typed-execution.html).
 
 ## Uruchomienie
 
@@ -95,7 +193,7 @@ zbiorze cyfr 8×8. Skrypt kończy się błędem, jeśli test accuracy nie osiąg
 
 ## Transformer
 
-`MATMUL` obsługuje także batch dimensions, dlatego ten sam pięciooperacyjny IR
+`MATMUL` obsługuje także batch dimensions, dlatego ten sam sześciooperacyjny IR
 pokrywa wielogłowe attention bez specjalnej instrukcji. Pakiet zawiera
 `LayerNorm`, `MultiHeadSelfAttention` i pre-norm `TransformerEncoderBlock`.
 
@@ -168,7 +266,7 @@ parametry BF16 i pozostają w natywnej pamięci MLX.
 
 ```bash
 .venv/bin/python -m pip install '.[llm,mlx]'
-.venv/bin/python examples/generate_tinyllama.py
+.venv/bin/python examples/generate_tinyllama.py --compiler mlx
 .venv/bin/python examples/generate_tinyllama.py \
   --prompt 'Explain lazy execution in one sentence.' \
   --temperature 0.7 --top-k 50 --max-new-tokens 32
@@ -180,7 +278,12 @@ wagi nie trafiają do repozytorium. Rewizja modelu jest przypięta do
 
 Prefill tworzy cache K/V, a każdy kolejny krok aktualizuje go maską. Embedding,
 RoPE, grouped-query attention, RMSNorm, SiLU, cache K/V i wybór ostatniej pozycji
-nadal składają się wyłącznie z pięciu instrukcji IR opisanych wyżej.
+nadal składają się wyłącznie z sześciu instrukcji IR opisanych wyżej. Backend
+MLX może rozpoznawać przenośne podgrafy RMSNorm, RoPE i attention i opuszczać
+je do szybszych kerneli; inne backendy wykonują ich zwykłe rozwinięcia.
+`TinyLlamaRuntime` materializuje wagi tylko raz i cache'uje programy prefill
+według kształtu oraz decode według długości cache. Dane tokenów i K/V są nadal
+wiązane osobno dla każdego żądania.
 
 Dla domyślnego promptu model generuje:
 
@@ -188,42 +291,62 @@ Dla domyślnego promptu model generuje:
 The capital of France is Paris.
 ```
 
-Na Apple M1 Max mediana pięciu osobnych uruchomień wyniosła 0,19 s do pierwszego
-tokenu i 46,2 tokenu/s dla rozgrzanych kroków decode; szczyt użycia GPU wyniósł
-około 2,11 GiB. Osiem identyfikatorów wygenerowanych tokenów jest identycznych
-z niezależnym wynikiem MLX-LM 0.31.3. MLX-LM jest wyspecjalizowanym runtime'em i
-osiągał w tym samym teście około 144 tokenów/s po rozgrzaniu; Chomik pozostaje
-celowo małym, czytelnym frameworkiem ogólnego przeznaczenia.
+Aktualne porównanie z MLX-LM uruchamia oba runtime'y w osobnych procesach,
+materializuje wagi przed pomiarem i sprawdza identyczność tokenów:
+
+```bash
+.venv/bin/python -m pip install '.[benchmark,llm]'
+.venv/bin/python benchmarks/tinyllama_vs_mlx_lm.py --trials 9
+```
+
+Przykładowy wynik na Apple M1 Max (`MLX 0.32.1`, `MLX-LM 0.31.3`, 28 tokenów
+promptu i osiem tokenów odpowiedzi):
+
+| TinyLlama 1.1B BF16 | Chomik | MLX-LM |
+|---|---:|---:|
+| pierwszy token, zimny graf | **0,077 s** | 0,121 s |
+| pełna odpowiedź, zimny graf | **0,157 s** | 0,201 s |
+| pierwszy token po rozgrzaniu | **0,024 s** | 0,041 s |
+| rozgrzany decode | 118,9 tokenu/s | **130,4 tokenu/s** |
+| pełna odpowiedź po rozgrzaniu | **0,084 s** | 0,094 s |
+| szczyt pamięci GPU | 2,118 GiB | 2,120 GiB |
+
+Chomik osiąga około 91% przepustowości decode natywnego MLX-LM, a dzięki cache
+całych programów ma krótszy TTFT dla powtarzanego kształtu. Wszystkie osiem
+identyfikatorów tokenów jest identyczne w obu implementacjach.
 
 ### Eksperyment TinyLlama względem tinygrad
 
 Porównanie wykonano na Apple M1 Max, macOS 27.0 i Pythonie 3.11.14. Chomik
-używał commita `6c69931` oraz MLX 0.32.1. tinygrad pochodził z oficjalnego taga
+używał MLX 0.32.1. tinygrad pochodził z oficjalnego taga
 [`v0.14.0`](https://github.com/tinygrad/tinygrad/tree/v0.14.0), commit
 `6f87158`; użyto jego implementacji `tinygrad.llm.model.Transformer`, `TinyJit`
 i cache K/V. Tag źródłowy był konieczny, ponieważ koło 0.14.0 z PyPI nie
 zawierało w testowanym środowisku katalogu `tinygrad.llm.kernels`.
 
-Oba frameworki dostały te same wagi BF16 przypiętej rewizji TinyLlama, ten sam
-28-tokenowy chat prompt, `batch=1`, greedy decoding i limit ośmiu nowych tokenów.
-Wagi były już w lokalnym cache, a czas ich pobierania nie wchodził do pomiaru.
-Wyniki zimnego Chomika są medianą pięciu osobnych procesów. Następnie dla obu
-frameworków wykonano po pięć generacji w tym samym procesie, już po capture.
-Dla tinygrad dodatkowo zapisano dwa zimne uruchomienia.
+Oba frameworki dostały te same wagi, aktywacje i cache K/V w BF16, przypiętą
+rewizję TinyLlama, ten sam 28-tokenowy chat prompt, `batch=1`, kontekst 36,
+czysty greedy argmax i limit ośmiu nowych tokenów. Ponieważ oficjalny model
+tinygrad konwertuje embedding do FP32 i cache do FP16, w tymczasowej kopii taga
+te dwa casty ustawiono na BF16; Gumbel sampling zastąpiono równoważnym dla
+temperatury zero bezpośrednim `argmax`. Wagi były już w lokalnym cache, a ich
+ładowanie nie wchodziło do pomiaru. Dla obu frameworków wykonano po sześć
+generacji. Wynik warm jest medianą ostatnich czterech prób; cache promptu był
+resetowany, więc oba frameworki ponownie wykonywały prefill.
 
 | TinyLlama 1.1B, Metal | Chomik | tinygrad 0.14.0 |
 |---|---:|---:|
-| pierwszy token, zimny JIT | **0,19 s** | 3,41–3,83 s |
-| pełne osiem tokenów, zimny JIT | **0,37 s** | 5,18–5,78 s |
-| pierwszy token po capture | **0,10 s** | 0,49 s |
-| pełne osiem tokenów po capture | **0,26 s** | 0,67 s |
-| rozgrzany decode | **45,8 tokenu/s** | 39,2 tokenu/s |
-| pamięć urządzenia | 2,11 GiB | **2,05 GiB** |
+| pierwszy token, zimny JIT | **0,078 s** | 2,585 s |
+| pełne osiem tokenów, zimny JIT | **0,174 s** | 4,335 s |
+| pierwszy token po capture | **0,024 s** | 0,389 s |
+| pełne osiem tokenów po capture | **0,085 s** | 0,550 s |
+| rozgrzany decode | **117,9 tokenu/s** | 43,6 tokenu/s |
+| pamięć urządzenia | 2,118 GiB | **2,052 GiB** |
 
-W stałym decode Chomik był około 17% szybszy, a cała krótka odpowiedź po
-rozgrzaniu zajmowała około 2,5 raza mniej czasu. Największa różnica wystąpiła
-przy zimnym JIT: tinygrad potrzebował dwóch dodatkowych wolnych kroków na
-capture i kompilację. tinygrad zużył około 3% mniej pamięci urządzenia.
+W stałym decode Chomik był około 2,7 raza szybszy, a cała krótka odpowiedź po
+rozgrzaniu zajmowała około 6,5 raza mniej czasu. Największa różnica wystąpiła
+przy zimnym JIT: tinygrad potrzebował dwóch wolnych przebiegów na capture i
+kompilację. tinygrad zużył około 3% mniej pamięci urządzenia.
 
 W obu przypadkach powstały identyczne identyfikatory tokenów:
 
@@ -232,8 +355,44 @@ W obu przypadkach powstały identyczne identyfikatory tokenów:
 The capital of France is Paris.
 ```
 
-Nie jest to porównanie identycznej precyzji aktywacji. Oficjalna ścieżka LLM
-tinygrad konwertuje wynik embeddingu do FP32 i przechowuje cache K/V w FP16;
-Chomik zachowuje BF16 dla aktywacji i cache. Wagi, model, prompt, wynik oraz
-urządzenie były jednak takie same. Dla dłuższych kontekstów i odpowiedzi
-proporcje mogą się zmienić.
+Porównanie wyrównuje dtype przechowywanych tensorów. Wewnętrzna precyzja
+akumulacji pozostaje decyzją kernela każdego frameworka. Zweryfikowano
+identyczne tokeny wynikowe, nie bitową identyczność wszystkich logits. Dla
+dłuższych kontekstów i odpowiedzi proporcje mogą się zmienić.
+
+### Eksperymentalne speculative decoding
+
+`LlamaDecoderBlock` weryfikuje kilka pozycji w jednym grafie, korzystając z
+tych samych sześciu operacji IR. Mechanizm nie należy do backendu MLX, więc
+przyszły backend CUDA albo Vulkan może skompilować dokładnie ten sam blok.
+Greedy runtime potrafi opcjonalnie użyć przypiętego
+`Felladrin/Llama-68M-Chat-v1` jako draftu. Przy ładowaniu sprawdza pełną mapę
+32 000 tokenów, a model docelowy akceptuje kandydatów tylko do pierwszej
+różnicy:
+
+```bash
+PYTHONPATH=. .venv/bin/python examples/generate_tinyllama.py \
+  --speculative-tokens 6 --temperature 0
+```
+
+Opcja jest domyślnie wyłączona. W BF16 blokowy target może użyć innego kernela
+Metal niż pojedynczy decode, a więc zmienić kolejność akumulacji. To nie zmienia
+dtype ani matematycznego algorytmu, ale po kilku zaakceptowanych tokenach
+zaokrąglenia cache K/V mogą prowadzić do innego `argmax`. Z tego powodu ten
+eksperyment nie spełnia jeszcze rygorystycznego wymagania identycznych tokenów.
+
+Powtarzalny benchmark obejmuje dziesięć promptów, wykonuje warianty w osobnych
+procesach i raportuje zarówno czas, jak i identyczność całej sekwencji:
+
+```bash
+PYTHONPATH=. .venv/bin/python benchmarks/tinyllama_speculative.py \
+  --trials 3 --speculative-tokens 6
+```
+
+Na Apple M1 Max osiem z dziesięciu przypadków zachowało identyczne tokeny, a
+tylko trzy były szybsze. Speedup wynosił od 1,00 do 1,06 raza w wygranych
+przypadkach, natomiast najgorszy przypadek był około 3,6 raza wolniejszy.
+Wniosek: przenośna infrastruktura działa, ale niezależny draft 68M i obecne
+kernele blokowe nie są jeszcze optymalizacją nadającą się do domyślnej ścieżki.
+Do bezpiecznego włączenia potrzeba kernela weryfikującego o zgodnej kolejności
+akumulacji oraz draftu wytrenowanego pod konkretny target.

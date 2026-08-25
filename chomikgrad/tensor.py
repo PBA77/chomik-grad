@@ -405,6 +405,45 @@ class Tensor:
             result._backward = backward
         return result
 
+    def gather(self, indices: "Tensor") -> "Tensor":
+        """Select rows by integer index, with a dense portable gradient."""
+        if not isinstance(indices, Tensor):
+            raise TypeError("gather indices must be a Tensor")
+        if not np.issubdtype(indices.dtype, np.integer):
+            raise TypeError("gather indices must have an integer dtype")
+        shape = indices.shape + self.shape[1:]
+        node = LazyNode(
+            Op.GATHER,
+            (self._node, indices._node),
+            None,
+            shape,
+            self.dtype,
+        )
+        tracks = _GRAD_ENABLED and self.requires_grad
+        result = Tensor._from_node(node, tracks)
+        if not tracks:
+            return result
+
+        result._parents = (self,)
+
+        def backward(grad: Tensor) -> BackwardResult:
+            rows = self.shape[0]
+            count = int(np.prod(indices.shape))
+            width = int(np.prod(self.shape[1:]))
+            raw_indices = indices._node.numpy_value().reshape(-1)
+            if np.any(raw_indices < 0) or np.any(raw_indices >= rows):
+                raise IndexError("gather index is outside the first dimension")
+            encoded = np.zeros((count, rows), dtype=self.dtype)
+            encoded[np.arange(count), raw_indices] = 1
+            one_hot = Tensor(encoded, copy=False)
+            source_grad = (one_hot.T @ grad.reshape(count, width)).reshape(
+                self.shape
+            )
+            return ((self, source_grad),)
+
+        result._backward = backward
+        return result
+
     def sum(self, axis: Axis = None, keepdims: bool = False) -> "Tensor":
         axes = _normalize_axes(axis, self.ndim)
         shape = _reduced_shape(self.shape, axes, keepdims)
@@ -469,8 +508,16 @@ def realize(
 
 
 def compile_graph(
-    *tensors: Tensor, compiler: Optional[str] = None
+    *tensors: Tensor,
+    compiler: Optional[str] = None,
+    dynamic_inputs: Sequence[Tensor] = (),
 ) -> CompiledProgram:
     if not tensors:
         raise ValueError("at least one tensor is required")
-    return get_compiler(compiler).compile([tensor._node for tensor in tensors])
+    selected = get_compiler(compiler)
+    outputs = [tensor._node for tensor in tensors]
+    if not dynamic_inputs:
+        return selected.compile(outputs)
+    return selected.compile(
+        outputs, [tensor._node for tensor in dynamic_inputs]
+    )

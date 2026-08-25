@@ -2,11 +2,104 @@ from __future__ import annotations
 
 import atexit
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Sequence, Tuple
+from pathlib import Path
+from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .lazy import Compiler, CompiledProgram, LazyNode, Op, topological_sort
+from .lazy import (
+    Compiler,
+    CompiledProgram,
+    DeviceAdapter,
+    LazyNode,
+    Op,
+    topological_sort,
+)
+
+
+class MLXDeviceAdapter(DeviceAdapter):
+    name = "mlx"
+
+    def __init__(self, mx: Any) -> None:
+        self._mx = mx
+
+    def array(self, value: object) -> Any:
+        return self._mx.array(value)
+
+    def evaluate(self, values: Sequence[object]) -> None:
+        self._mx.eval(values)
+
+    def synchronize(self) -> None:
+        self._mx.synchronize()
+
+    def to_numpy(self, value: object) -> np.ndarray:
+        native = value
+        if native.dtype == self._mx.bfloat16:  # type: ignore[attr-defined]
+            native = native.astype(self._mx.float32)  # type: ignore[attr-defined]
+        return np.array(native)
+
+    def argmax(self, value: object) -> int:
+        selected = self._mx.argmax(value)
+        self._mx.eval(selected)
+        return int(selected.item())
+
+    def argmax_last_axis(self, value: object) -> np.ndarray:
+        selected = self._mx.argmax(value, axis=-1)
+        self._mx.eval(selected)
+        return np.array(selected)
+
+    def dtype(self, value: object) -> np.dtype:
+        native_types = {
+            self._mx.bool_: np.dtype(np.bool_),
+            self._mx.int8: np.dtype(np.int8),
+            self._mx.int16: np.dtype(np.int16),
+            self._mx.int32: np.dtype(np.int32),
+            self._mx.int64: np.dtype(np.int64),
+            self._mx.uint8: np.dtype(np.uint8),
+            self._mx.uint16: np.dtype(np.uint16),
+            self._mx.uint32: np.dtype(np.uint32),
+            self._mx.uint64: np.dtype(np.uint64),
+            self._mx.float16: np.dtype(np.float16),
+            self._mx.float32: np.dtype(np.float32),
+            self._mx.float64: np.dtype(np.float64),
+            self._mx.complex64: np.dtype(np.complex64),
+        }
+        native_dtype = getattr(value, "dtype", None)
+        if native_dtype == self._mx.bfloat16:
+            try:
+                import ml_dtypes
+            except ImportError as error:
+                raise ImportError(
+                    "BF16 metadata requires `python -m pip install ml-dtypes`"
+                ) from error
+            return np.dtype(ml_dtypes.bfloat16)
+        try:
+            return native_types[native_dtype]
+        except KeyError as error:
+            raise TypeError(f"unsupported MLX dtype: {value!r}") from error
+
+    def load_safetensors(
+        self, path: Path, *, dtype: Optional[np.dtype] = None
+    ) -> Mapping[str, object]:
+        native = self._mx.load(str(path))
+        if not isinstance(native, dict):
+            raise ValueError("expected a named safetensors weight file")
+        if dtype is not None:
+            requested = np.dtype(dtype)
+            if requested == np.dtype(np.float16):
+                target = self._mx.float16
+            elif requested.name == "bfloat16":
+                target = self._mx.bfloat16
+            else:
+                raise TypeError(f"unsupported MLX weight dtype: {requested}")
+            native = {name: value.astype(target) for name, value in native.items()}
+        return native
+
+    def reset_peak_memory(self) -> None:
+        self._mx.reset_peak_memory()
+
+    def peak_memory_bytes(self) -> Optional[int]:
+        return int(self._mx.get_peak_memory())
 
 
 @dataclass
@@ -14,34 +107,45 @@ class MLXProgram(CompiledProgram):
     source: str
     inputs: Tuple[LazyNode, ...]
     _run: Callable[[Sequence[Any]], Tuple[Any, ...]]
-    _mx: Any
+    device: MLXDeviceAdapter
     _load_input: Callable[[LazyNode], Any]
 
-    def run_native(self, *, evaluate: bool = True) -> Tuple[Any, ...]:
-        gpu = self._mx.Device(self._mx.gpu, 0)
-        with self._mx.stream(gpu):
-            values = [self._load_input(node) for node in self.inputs]
+    def run(
+        self,
+        bindings: Optional[Mapping[LazyNode, object]] = None,
+        *,
+        synchronize: bool = False,
+    ) -> Tuple[object, ...]:
+        mx = self.device._mx
+        gpu = mx.Device(mx.gpu, 0)
+        with mx.stream(gpu):
+            replacements = bindings or {}
+            values = [
+                replacements[node]
+                if node in replacements
+                else self._load_input(node)
+                for node in self.inputs
+            ]
             outputs = self._run(values)
-            if evaluate:
-                self._mx.eval(outputs)
+            if synchronize:
+                self.device.evaluate(outputs)
         return tuple(outputs)
 
-    def __call__(self) -> Tuple[np.ndarray, ...]:
-        outputs = self.run_native()
-        # NumPy has no native BF16 buffer format. Only explicit CPU readback is
-        # widened; the compiled graph and cached parameters remain BF16 on GPU.
-        return tuple(
-            np.array(
-                output.astype(self._mx.float32)
-                if output.dtype == self._mx.bfloat16
-                else output
-            )
-            for output in outputs
+    def run_native(
+        self,
+        *,
+        evaluate: bool = True,
+        input_values: Optional[Mapping[LazyNode, Any]] = None,
+    ) -> Tuple[Any, ...]:
+        """Compatibility alias for the backend-neutral run method."""
+        return self.run(  # type: ignore[return-value]
+            input_values,
+            synchronize=evaluate,
         )
 
 
 class MLXCompiler(Compiler):
-    """Translate the five-operation IR to MLX and execute it on Metal GPU."""
+    """Translate the six-operation IR to MLX and execute it on Metal GPU."""
 
     _BINARY = {
         "add": "mx.add({0}, {1})",
@@ -70,13 +174,14 @@ class MLXCompiler(Compiler):
         if not mx.metal.is_available():
             raise RuntimeError("the MLX backend requires an available Metal GPU")
         self._mx = mx
+        self.device = MLXDeviceAdapter(mx)
         self._program_cache: Dict[object, Tuple[str, Callable[..., Any]]] = {}
         atexit.register(self.close)
 
     def close(self) -> None:
         if not self._program_cache:
             return
-        self._mx.synchronize()
+        self.device.synchronize()
         self._program_cache.clear()
         self._mx.clear_cache()
 
@@ -92,7 +197,7 @@ class MLXCompiler(Compiler):
             raise TypeError(
                 "MLX does not support float64; create this tensor as float32"
             )
-        native = self._mx.array(value)
+        native = self.device.array(value)
         if node.cache_native:
             node.native_values["mlx"] = native
         return native
@@ -107,6 +212,18 @@ class MLXCompiler(Compiler):
         for node in nodes:
             if node.op is None:
                 specifications.append((None, node.shape, node.dtype.str))
+            elif node.lowering is not None:
+                kind, inputs, argument = node.lowering
+                specifications.append(
+                    (
+                        "lowering",
+                        kind,
+                        argument,
+                        node.shape,
+                        node.dtype.str,
+                        tuple(indexes[parent] for parent in inputs),
+                    )
+                )
             else:
                 specifications.append(
                     (
@@ -119,17 +236,38 @@ class MLXCompiler(Compiler):
                 )
         return tuple(specifications), tuple(indexes[node] for node in outputs)
 
-    def compile(self, outputs: Sequence[LazyNode]) -> MLXProgram:
+    def compile(
+        self,
+        outputs: Sequence[LazyNode],
+        dynamic_inputs: Sequence[LazyNode] = (),
+    ) -> MLXProgram:
         if not outputs:
             raise ValueError("at least one output is required")
+        if any(node.op is not None for node in dynamic_inputs):
+            raise ValueError("dynamic inputs must be graph leaves")
+        requested_dynamic = set(dynamic_inputs)
+        portable_leaves = {
+            node for node in topological_sort(outputs) if node.op is None
+        }
+        lowered_leaves = {
+            node
+            for node in topological_sort(outputs, use_lowerings=True)
+            if node.op is None
+        }
+        if not requested_dynamic.issubset(portable_leaves | lowered_leaves):
+            raise ValueError("dynamic input is not a leaf of the compiled graph")
 
-        nodes = topological_sort(outputs)
+        nodes = topological_sort(outputs, use_lowerings=True)
         leaves = tuple(node for node in nodes if node.op is None)
+        program_inputs = tuple(
+            node for node in leaves if node in requested_dynamic
+        )
+        specialized = bool(dynamic_inputs)
         signature = self._signature(nodes, outputs)
-        cached = self._program_cache.get(signature)
+        cached = None if specialized else self._program_cache.get(signature)
         if cached is not None:
             source, run = cached
-            return MLXProgram(source, leaves, run, self._mx, self._load_input)
+            return MLXProgram(source, leaves, run, self.device, self._load_input)
 
         names = {node: f"v{index}" for index, node in enumerate(nodes)}
         leaf_indexes = {node: index for index, node in enumerate(leaves)}
@@ -140,8 +278,14 @@ class MLXCompiler(Compiler):
             if node.op is None:
                 lines.append(f"    {name} = inputs[{leaf_indexes[node]}]")
                 continue
-            args = [names[parent] for parent in node.inputs]
-            lines.append(f"    {name} = {self._expression(node, args)}")
+            args = (
+                []
+                if node.lowering is not None
+                else [names[parent] for parent in node.inputs]
+            )
+            lines.append(
+                f"    {name} = {self._expression(node, args, names)}"
+            )
 
         rendered_outputs = ", ".join(names[node] for node in outputs)
         if len(outputs) == 1:
@@ -155,13 +299,32 @@ class MLXCompiler(Compiler):
             {"mx": self._mx},
             namespace,
         )
-        run = self._mx.compile(namespace["run"])
-        self._program_cache[signature] = source, run
+        raw_run = namespace["run"]
+        if specialized:
+            dynamic_indexes = {
+                node: index for index, node in enumerate(program_inputs)
+            }
+            template = [
+                None if node in requested_dynamic else self._load_input(node)
+                for node in leaves
+            ]
+
+            def run_dynamic(values: Sequence[Any]) -> Tuple[Any, ...]:
+                merged = list(template)
+                for leaf_index, node in enumerate(leaves):
+                    if node in dynamic_indexes:
+                        merged[leaf_index] = values[dynamic_indexes[node]]
+                return raw_run(merged)
+
+            run = self._mx.compile(run_dynamic)
+        else:
+            run = self._mx.compile(raw_run)
+            self._program_cache[signature] = source, run
         return MLXProgram(  # type: ignore[arg-type]
             source,
-            leaves,
+            program_inputs if specialized else leaves,
             run,
-            self._mx,
+            self.device,
             self._load_input,
         )
 
@@ -171,7 +334,7 @@ class MLXCompiler(Compiler):
         gradients: Sequence[LazyNode],
         learning_rate: float,
     ) -> Tuple[Tuple[LazyNode, ...], Tuple[LazyNode, ...]]:
-        native_gradients = self.compile(gradients).run_native(evaluate=False)
+        native_gradients = self.compile(gradients).run(synchronize=False)
         native_parameters = [self._load_input(node) for node in parameters]
         gpu = self._mx.Device(self._mx.gpu, 0)
         with self._mx.stream(gpu):
@@ -190,7 +353,36 @@ class MLXCompiler(Compiler):
         )
         return parameter_nodes, gradient_nodes
 
-    def _expression(self, node: LazyNode, args: Sequence[str]) -> str:
+    def _expression(
+        self,
+        node: LazyNode,
+        args: Sequence[str],
+        names: Mapping[LazyNode, str],
+    ) -> str:
+        if node.lowering is not None:
+            kind, inputs, argument = node.lowering
+            lowered = [names[parent] for parent in inputs]
+            if kind == "rms_norm":
+                return (
+                    f"mx.fast.rms_norm({lowered[0]}, {lowered[1]}, "
+                    f"{float(argument)!r})"
+                )
+            if kind == "rope":
+                dimensions, theta, offset = argument
+                actual_offset = lowered[1] if len(lowered) == 2 else repr(offset)
+                return (
+                    f"mx.fast.rope({lowered[0]}, {int(dimensions)!r}, "
+                    f"traditional=False, base={float(theta)!r}, scale=1.0, "
+                    f"offset={actual_offset})"
+                )
+            if kind == "sdpa":
+                return (
+                    "mx.fast.scaled_dot_product_attention("
+                    f"{lowered[0]}, {lowered[1]}, {lowered[2]}, "
+                    f"scale={float(argument)!r}, mask={lowered[3]})"
+                )
+            raise ValueError(f"unsupported MLX lowering: {kind}")
+
         if node.op is Op.ELEMENTWISE:
             kind = str(node.arg)
             if kind in self._BINARY:
@@ -213,5 +405,8 @@ class MLXCompiler(Compiler):
 
         if node.op is Op.MATMUL:
             return f"mx.matmul({args[0]}, {args[1]})"
+
+        if node.op is Op.GATHER:
+            return f"mx.take({args[0]}, {args[1]}, axis=0)"
 
         raise ValueError(f"unsupported operation: {node.op}")

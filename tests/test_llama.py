@@ -1,17 +1,27 @@
 import unittest
+from pathlib import Path
 
 import numpy as np
 
-from chomikgrad import Tensor, realize
+from chomikgrad import NumpyDeviceAdapter, Tensor, realize
 from chomikgrad.llama import (
     LlamaConfig,
+    LlamaDecoderBlock,
     LlamaDecoderStep,
     LlamaForCausalLM,
     _rope_rotations,
+    load_safetensors,
     position_selector,
     required_weight_shapes,
     token_one_hot,
 )
+
+
+class FakeWeightDevice(NumpyDeviceAdapter):
+    name = "fake"
+
+    def load_safetensors(self, path):
+        return {"weight": np.array([[1.0, 2.0]], dtype=np.float32)}
 
 
 class LlamaHelpersTests(unittest.TestCase):
@@ -67,6 +77,15 @@ class LlamaHelpersTests(unittest.TestCase):
         self.assertEqual(value.shape, (2, 3))
         self.assertEqual(value.dtype, np.dtype(np.float32))
         self.assertIs(value._node.native_values["test"], marker)
+
+    def test_weight_loading_uses_device_adapter(self) -> None:
+        weights = load_safetensors(Path("unused.safetensors"), FakeWeightDevice())
+
+        self.assertEqual(weights["weight"].shape, (1, 2))
+        self.assertEqual(weights["weight"].dtype, np.dtype(np.float32))
+        np.testing.assert_array_equal(
+            weights["weight"]._node.native_values["fake"], [[1.0, 2.0]]
+        )
 
     def test_cached_decode_matches_full_causal_forward(self) -> None:
         config = LlamaConfig(
@@ -181,6 +200,123 @@ class LlamaHelpersTests(unittest.TestCase):
             ),
         ).numpy()
         np.testing.assert_allclose(decoded, expected, rtol=2e-5, atol=2e-6)
+
+    def test_block_decode_matches_each_full_causal_position(self) -> None:
+        config = LlamaConfig(
+            vocab_size=8,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            max_position_embeddings=8,
+        )
+        rng = np.random.default_rng(14)
+        weights = {
+            name: Tensor(
+                np.ones(shape, dtype=np.float32)
+                if "norm.weight" in name
+                else rng.normal(0, 0.05, shape).astype(np.float32)
+            )
+            for name, shape in required_weight_shapes(config).items()
+        }
+        prompt = [1, 3, 4]
+        proposed = [6, 2]
+        cache_length = len(prompt) + len(proposed)
+        prefill = LlamaForCausalLM(
+            config,
+            weights,
+            sequence_length=len(prompt),
+            cache_length=cache_length,
+            dtype=np.float32,
+        )
+        prefill_native = realize(
+            *prefill.prefill(
+                Tensor(np.asarray([prompt], dtype=np.int32), copy=False),
+                Tensor(position_selector(2, 3, dtype=np.float32)),
+            )
+        )
+        caches = [
+            (Tensor(prefill_native[index]), Tensor(prefill_native[index + 1]))
+            for index in range(1, len(prefill_native), 2)
+        ]
+        placement = np.zeros((2, cache_length), dtype=np.float32)
+        placement[np.arange(2), np.arange(3, 5)] = 1
+        write_mask = placement.sum(axis=0).reshape(1, 1, cache_length, 1)
+        attention_mask = np.full(
+            (1, 1, 2, cache_length), -1e4, dtype=np.float32
+        )
+        attention_mask[0, 0, 0, :4] = 0
+        attention_mask[0, 0, 1, :5] = 0
+        block = LlamaDecoderBlock(
+            config,
+            weights,
+            block_length=2,
+            cache_length=cache_length,
+            dtype=np.float32,
+        )
+        actual = realize(
+            *block(
+                Tensor(np.asarray([proposed], dtype=np.int32), copy=False),
+                Tensor(
+                    _rope_rotations(
+                        2,
+                        config.head_size,
+                        config.rope_theta,
+                        np.dtype(np.float32),
+                        offset=3,
+                    )
+                ),
+                Tensor(attention_mask),
+                Tensor(placement),
+                Tensor(write_mask),
+                caches,
+            )
+        )
+
+        for index in range(2):
+            tokens = prompt + proposed[: index + 1]
+            full = LlamaForCausalLM(
+                config,
+                weights,
+                sequence_length=len(tokens),
+                dtype=np.float32,
+            )
+            expected = full(
+                Tensor(np.asarray([tokens], dtype=np.int32), copy=False),
+                Tensor(
+                    position_selector(
+                        len(tokens) - 1, len(tokens), dtype=np.float32
+                    )
+                ),
+            ).numpy()
+            np.testing.assert_allclose(
+                actual[0][:, index, :], expected, rtol=2e-5, atol=2e-6
+            )
+
+        full_prefill = LlamaForCausalLM(
+            config,
+            weights,
+            sequence_length=cache_length,
+            cache_length=cache_length,
+            dtype=np.float32,
+        )
+        complete = realize(
+            *full_prefill.prefill(
+                Tensor(
+                    np.asarray([prompt + proposed], dtype=np.int32), copy=False
+                ),
+                Tensor(
+                    position_selector(
+                        cache_length - 1, cache_length, dtype=np.float32
+                    )
+                ),
+            )
+        )
+        for block_cache, full_cache in zip(actual[1:], complete[1:]):
+            np.testing.assert_allclose(
+                block_cache, full_cache, rtol=2e-5, atol=2e-6
+            )
 
 
 if __name__ == "__main__":

@@ -14,15 +14,20 @@ demo = ["scikit-learn>=1.2"]
 mlx = [
     "mlx>=0.32.1; python_version >= '3.10' and platform_system == 'Darwin' and platform_machine == 'arm64'",
 ]
+coreml = [
+    "coremltools>=9.0,<10; python_version >= '3.10' and platform_system == 'Darwin' and platform_machine == 'arm64'",
+]
 llm = [
     "huggingface-hub>=0.28",
     "ml-dtypes>=0.5",
     "tokenizers>=0.20",
 ]
 benchmark = [
+    "coremltools>=9.0,<10; python_version >= '3.10' and platform_system == 'Darwin' and platform_machine == 'arm64'",
     "scikit-learn>=1.2",
     "tinygrad>=0.14",
     "mlx>=0.32.1; python_version >= '3.10' and platform_system == 'Darwin' and platform_machine == 'arm64'",
+    "mlx-lm>=0.31.3; python_version >= '3.10' and platform_system == 'Darwin' and platform_machine == 'arm64'",
 ]
 
 [tool.setuptools.packages.find]

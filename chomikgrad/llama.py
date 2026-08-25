@@ -6,7 +6,23 @@ from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .lazy import DeviceAdapter, get_compiler
 from .tensor import Tensor
+
+
+def _prefer_lowering(
+    output: Tensor,
+    kind: str,
+    inputs: Sequence[Tensor],
+    argument: object,
+) -> Tensor:
+    """Attach an optional compiler lowering while retaining the portable graph."""
+    output._node.lowering = (
+        kind,
+        tuple(tensor._node for tensor in inputs),
+        argument,
+    )
+    return output
 
 
 @dataclass(frozen=True)
@@ -167,43 +183,34 @@ def position_selector(
     return result
 
 
-def load_mlx_safetensors(path: Path) -> Dict[str, Tensor]:
-    """Load safetensors directly as native MLX leaves, preserving BF16."""
-    try:
-        import ml_dtypes
-        import mlx.core as mx
-    except ImportError as error:
-        raise ImportError(
-            "loading BF16 Llama weights requires `chomik-grad[llm,mlx]`"
-        ) from error
-
-    native = mx.load(str(path))
-    if not isinstance(native, dict):
-        raise ValueError("expected a named safetensors weight file")
-    dtype_map = {
-        mx.bfloat16: np.dtype(ml_dtypes.bfloat16),
-        mx.float16: np.dtype(np.float16),
-        mx.float32: np.dtype(np.float32),
-    }
+def load_safetensors(
+    path: Path, device: DeviceAdapter, *, dtype: Optional[np.dtype] = None
+) -> Dict[str, Tensor]:
+    """Load native weights through a backend's device adapter."""
+    native = (
+        device.load_safetensors(path)
+        if dtype is None
+        else device.load_safetensors(path, dtype=np.dtype(dtype))
+    )
     weights: Dict[str, Tensor] = {}
     for name, value in native.items():
-        try:
-            dtype = dtype_map[value.dtype]
-        except KeyError as error:
-            raise TypeError(
-                f"unsupported MLX weight dtype for {name}: {value.dtype}"
-            ) from error
         weights[name] = Tensor.from_native(
             value,
-            backend="mlx",
+            backend=device.name,
             shape=tuple(value.shape),
-            dtype=dtype,
+            dtype=device.dtype(value),
         )
     return weights
 
 
+def load_mlx_safetensors(path: Path) -> Dict[str, Tensor]:
+    """Compatibility wrapper around the backend-neutral weight loader."""
+    compiler = get_compiler("mlx")
+    return load_safetensors(path, compiler.device)
+
+
 class LlamaForCausalLM:
-    """A Llama decoder expressed entirely with Chomik's five-operation IR."""
+    """A Llama decoder expressed entirely with Chomik's six-operation IR."""
 
     def __init__(
         self,
@@ -271,7 +278,13 @@ class LlamaForCausalLM:
 
     def _rms_norm(self, inputs: Tensor, weight: Tensor) -> Tensor:
         variance = (inputs * inputs).mean(axis=-1, keepdims=True)
-        return inputs / (variance + self.config.rms_norm_eps).sqrt() * weight
+        output = inputs / (variance + self.config.rms_norm_eps).sqrt() * weight
+        return _prefer_lowering(
+            output,
+            "rms_norm",
+            (inputs, weight),
+            self.config.rms_norm_eps,
+        )
 
     @staticmethod
     def _silu(inputs: Tensor) -> Tensor:
@@ -279,10 +292,35 @@ class LlamaForCausalLM:
 
     def _apply_rope(self, inputs: Tensor) -> Tensor:
         batch, heads, tokens, head_size = inputs.shape
-        return (
+        output = (
             inputs.reshape(batch, heads, tokens, 1, head_size)
             @ self.rotations
         ).reshape(batch, heads, tokens, head_size)
+        return _prefer_lowering(
+            output,
+            "rope",
+            (inputs,),
+            (head_size, self.config.rope_theta, 0),
+        )
+
+    def _apply_rotation(
+        self,
+        inputs: Tensor,
+        rotation: Tensor,
+        position: Optional[Tensor],
+    ) -> Tensor:
+        batch, heads, tokens, head_size = inputs.shape
+        output = (
+            inputs.reshape(batch, heads, tokens, 1, head_size) @ rotation
+        ).reshape(batch, heads, tokens, head_size)
+        if position is None:
+            return output
+        return _prefer_lowering(
+            output,
+            "rope",
+            (inputs, position),
+            (head_size, self.config.rope_theta, 0),
+        )
 
     def _repeat_kv(self, inputs: Tensor) -> Tensor:
         batch, kv_heads, tokens, head_size = inputs.shape
@@ -318,6 +356,12 @@ class LlamaForCausalLM:
             query @ key.transpose(-2, -1)
         ) / np.sqrt(config.head_size) + self.causal_mask
         attended = scores.softmax(axis=-1) @ value
+        attended = _prefer_lowering(
+            attended,
+            "sdpa",
+            (query, cached_key, cached_value, self.causal_mask),
+            1 / np.sqrt(config.head_size),
+        )
         merged = attended.permute(0, 2, 1, 3).reshape(
             batch, tokens, config.hidden_size
         )
@@ -342,16 +386,19 @@ class LlamaForCausalLM:
         *,
         collect_cache: bool,
     ) -> Tuple[Tensor, ...]:
-        if token_matrix.shape != (
-            1,
-            self.sequence_length,
-            self.config.vocab_size,
-        ):
+        token_ids = (1, self.sequence_length)
+        token_one_hot_shape = (
+            1, self.sequence_length, self.config.vocab_size
+        )
+        if token_matrix.shape not in (token_ids, token_one_hot_shape):
             raise ValueError("token matrix has the wrong fixed-context shape")
         if selector.shape != (1, self.sequence_length):
             raise ValueError("position selector has the wrong shape")
 
-        hidden = token_matrix @ self.weights["model.embed_tokens.weight"]
+        if token_matrix.shape == token_ids:
+            hidden = self.weights["model.embed_tokens.weight"].gather(token_matrix)
+        else:
+            hidden = token_matrix @ self.weights["model.embed_tokens.weight"]
         caches = []
         for layer in range(self.config.num_hidden_layers):
             prefix = f"model.layers.{layer}"
@@ -387,7 +434,7 @@ class LlamaForCausalLM:
 
 
 class LlamaDecoderStep(LlamaForCausalLM):
-    """One cached autoregressive step, still using only the five IR ops."""
+    """One cached autoregressive step, still using only the six IR ops."""
 
     def __init__(
         self,
@@ -414,9 +461,11 @@ class LlamaDecoderStep(LlamaForCausalLM):
         attention_mask: Tensor,
         write_mask: Tensor,
         caches: Sequence[Tuple[Tensor, Tensor]],
+        *,
+        position: Optional[Tensor] = None,
     ) -> Tuple[Tensor, ...]:
         config = self.config
-        if token_matrix.shape != (1, 1, config.vocab_size):
+        if token_matrix.shape not in ((1, 1), (1, 1, config.vocab_size)):
             raise ValueError("decode token matrix must contain exactly one token")
         if rotation.shape != (1, 1, 1, config.head_size, config.head_size):
             raise ValueError("decode RoPE rotation has the wrong shape")
@@ -426,8 +475,13 @@ class LlamaDecoderStep(LlamaForCausalLM):
             raise ValueError("decode cache write mask has the wrong shape")
         if len(caches) != config.num_hidden_layers:
             raise ValueError("decode requires one KV cache pair per layer")
+        if position is not None and position.shape != ():
+            raise ValueError("decode position must be a scalar")
 
-        hidden = token_matrix @ self.weights["model.embed_tokens.weight"]
+        if token_matrix.shape == (1, 1):
+            hidden = self.weights["model.embed_tokens.weight"].gather(token_matrix)
+        else:
+            hidden = token_matrix @ self.weights["model.embed_tokens.weight"]
         updated_caches = []
         for layer, (cached_key, cached_value) in enumerate(caches):
             expected = (
@@ -452,14 +506,8 @@ class LlamaDecoderStep(LlamaForCausalLM):
             value = self._linear(
                 normalized, self.weights[f"{attention_prefix}.v_proj.weight"]
             ).reshape(1, config.num_key_value_heads, 1, config.head_size)
-            query = (
-                query.reshape(1, config.num_attention_heads, 1, 1, config.head_size)
-                @ rotation
-            ).reshape(1, config.num_attention_heads, 1, config.head_size)
-            key = (
-                key.reshape(1, config.num_key_value_heads, 1, 1, config.head_size)
-                @ rotation
-            ).reshape(1, config.num_key_value_heads, 1, config.head_size)
+            query = self._apply_rotation(query, rotation, position)
+            key = self._apply_rotation(key, rotation, position)
             cached_key = cached_key * (1 - write_mask) + key * write_mask
             cached_value = cached_value * (1 - write_mask) + value * write_mask
             updated_caches.append((cached_key, cached_value))
@@ -469,6 +517,12 @@ class LlamaDecoderStep(LlamaForCausalLM):
                 query @ repeated_key.transpose(-2, -1)
             ) / np.sqrt(config.head_size) + attention_mask
             attended = scores.softmax(axis=-1) @ repeated_value
+            attended = _prefer_lowering(
+                attended,
+                "sdpa",
+                (query, cached_key, cached_value, attention_mask),
+                1 / np.sqrt(config.head_size),
+            )
             merged = attended.permute(0, 2, 1, 3).reshape(
                 1, 1, config.hidden_size
             )
@@ -485,5 +539,130 @@ class LlamaDecoderStep(LlamaForCausalLM):
             hidden.reshape(1, config.hidden_size),
             self.weights["lm_head.weight"],
         )
+        flat_caches = [tensor for pair in updated_caches for tensor in pair]
+        return (logits, *flat_caches)
+
+
+class LlamaDecoderBlock(LlamaForCausalLM):
+    """Verify several cached autoregressive positions in one portable graph."""
+
+    def __init__(
+        self,
+        config: LlamaConfig,
+        weights: Mapping[str, Tensor],
+        *,
+        block_length: int,
+        cache_length: int,
+        dtype: np.dtype,
+    ) -> None:
+        super().__init__(
+            config,
+            weights,
+            sequence_length=block_length,
+            dtype=dtype,
+        )
+        if cache_length < block_length or cache_length > config.max_position_embeddings:
+            raise ValueError("invalid KV cache length")
+        self.block_length = block_length
+        self.cache_length = cache_length
+
+    def __call__(
+        self,
+        token_matrix: Tensor,
+        rotation: Tensor,
+        attention_mask: Tensor,
+        cache_placement: Tensor,
+        write_mask: Tensor,
+        caches: Sequence[Tuple[Tensor, Tensor]],
+        *,
+        position: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, ...]:
+        config = self.config
+        block = self.block_length
+        if token_matrix.shape not in (
+            (1, block),
+            (1, block, config.vocab_size),
+        ):
+            raise ValueError("decode block has the wrong token shape")
+        if rotation.shape != (1, 1, block, config.head_size, config.head_size):
+            raise ValueError("decode block RoPE rotation has the wrong shape")
+        if attention_mask.shape != (1, 1, block, self.cache_length):
+            raise ValueError("decode block attention mask has the wrong shape")
+        if cache_placement.shape != (block, self.cache_length):
+            raise ValueError("decode block cache placement has the wrong shape")
+        if write_mask.shape != (1, 1, self.cache_length, 1):
+            raise ValueError("decode block write mask has the wrong shape")
+        if len(caches) != config.num_hidden_layers:
+            raise ValueError("decode block requires one KV cache pair per layer")
+        if position is not None and position.shape != ():
+            raise ValueError("decode block position must be a scalar")
+
+        if token_matrix.shape == (1, block):
+            hidden = self.weights["model.embed_tokens.weight"].gather(token_matrix)
+        else:
+            hidden = token_matrix @ self.weights["model.embed_tokens.weight"]
+        updated_caches = []
+        for layer, (cached_key, cached_value) in enumerate(caches):
+            expected = (
+                1,
+                config.num_key_value_heads,
+                self.cache_length,
+                config.head_size,
+            )
+            if cached_key.shape != expected or cached_value.shape != expected:
+                raise ValueError("KV cache has the wrong shape")
+            prefix = f"model.layers.{layer}"
+            normalized = self._rms_norm(
+                hidden, self.weights[f"{prefix}.input_layernorm.weight"]
+            )
+            attention_prefix = f"{prefix}.self_attn"
+            query = self._linear(
+                normalized, self.weights[f"{attention_prefix}.q_proj.weight"]
+            ).reshape(1, block, config.num_attention_heads, config.head_size)
+            key = self._linear(
+                normalized, self.weights[f"{attention_prefix}.k_proj.weight"]
+            ).reshape(1, block, config.num_key_value_heads, config.head_size)
+            value = self._linear(
+                normalized, self.weights[f"{attention_prefix}.v_proj.weight"]
+            ).reshape(1, block, config.num_key_value_heads, config.head_size)
+            query = query.permute(0, 2, 1, 3)
+            key = key.permute(0, 2, 1, 3)
+            value = value.permute(0, 2, 1, 3)
+            query = self._apply_rotation(query, rotation, position)
+            key = self._apply_rotation(key, rotation, position)
+            placed_key = (
+                key.permute(0, 1, 3, 2) @ cache_placement
+            ).permute(0, 1, 3, 2)
+            placed_value = (
+                value.permute(0, 1, 3, 2) @ cache_placement
+            ).permute(0, 1, 3, 2)
+            cached_key = cached_key * (1 - write_mask) + placed_key
+            cached_value = cached_value * (1 - write_mask) + placed_value
+            updated_caches.append((cached_key, cached_value))
+            repeated_key = self._repeat_kv(cached_key)
+            repeated_value = self._repeat_kv(cached_value)
+            scores = (
+                query @ repeated_key.transpose(-2, -1)
+            ) / np.sqrt(config.head_size) + attention_mask
+            attended = scores.softmax(axis=-1) @ repeated_value
+            attended = _prefer_lowering(
+                attended,
+                "sdpa",
+                (query, cached_key, cached_value, attention_mask),
+                1 / np.sqrt(config.head_size),
+            )
+            merged = attended.permute(0, 2, 1, 3).reshape(
+                1, block, config.hidden_size
+            )
+            hidden = hidden + self._linear(
+                merged, self.weights[f"{attention_prefix}.o_proj.weight"]
+            )
+            normalized = self._rms_norm(
+                hidden, self.weights[f"{prefix}.post_attention_layernorm.weight"]
+            )
+            hidden = hidden + self._mlp(normalized, layer)
+
+        hidden = self._rms_norm(hidden, self.weights["model.norm.weight"])
+        logits = self._linear(hidden, self.weights["lm_head.weight"])
         flat_caches = [tensor for pair in updated_caches for tensor in pair]
         return (logits, *flat_caches)
