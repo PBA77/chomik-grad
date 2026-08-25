@@ -9,6 +9,7 @@ from .lazy import (
     set_default_compiler,
 )
 from .mlx_backend import MLXCompiler, MLXProgram
+from .llama import LlamaConfig, LlamaDecoderStep, LlamaForCausalLM
 from .nn import (
     CrossEntropyLoss,
     LayerNorm,
@@ -32,6 +33,9 @@ __all__ = [
     "CrossEntropyLoss",
     "LazyNode",
     "LayerNorm",
+    "LlamaConfig",
+    "LlamaDecoderStep",
+    "LlamaForCausalLM",
     "Linear",
     "Module",
     "MultiHeadSelfAttention",

@@ -80,6 +80,28 @@ class Tensor:
         return tensor
 
     @classmethod
+    def from_native(
+        cls,
+        value: object,
+        *,
+        backend: str,
+        shape: Sequence[int],
+        dtype: np.dtype,
+    ) -> "Tensor":
+        """Wrap storage already owned by a compiler backend without copying it."""
+        if not backend:
+            raise ValueError("backend name cannot be empty")
+        native_shape = tuple(int(size) for size in shape)
+        if any(size < 0 for size in native_shape):
+            raise ValueError("native tensor dimensions cannot be negative")
+        tensor = cls._from_node(
+            LazyNode.native_leaf(backend, value, native_shape, np.dtype(dtype)),
+            requires_grad=False,
+        )
+        tensor._is_leaf = True
+        return tensor
+
+    @classmethod
     def zeros(
         cls, shape: Sequence[int], *, dtype: np.dtype = np.float32
     ) -> "Tensor":
@@ -237,6 +259,8 @@ class Tensor:
                 contribution = grad * result
             elif kind == "log":
                 contribution = grad / self
+            elif kind == "sqrt":
+                contribution = grad / (2 * result)
             elif kind == "relu":
                 contribution = grad * self._unary("step")
             else:
@@ -296,7 +320,7 @@ class Tensor:
         return self._unary("relu")
 
     def sqrt(self) -> "Tensor":
-        return (self.log() * 0.5).exp()
+        return self._unary("sqrt")
 
     def softmax(self, axis: int = -1) -> "Tensor":
         maximum = self.max(axis=axis, keepdims=True).detach()

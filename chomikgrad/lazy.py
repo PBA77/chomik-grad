@@ -150,6 +150,7 @@ class NumpyCompiler(Compiler):
         "neg": "np.negative({0})",
         "exp": "np.exp({0})",
         "log": "np.log({0})",
+        "sqrt": "np.sqrt({0})",
         "relu": "np.maximum({0}, 0)",
         "step": "np.greater({0}, 0).astype({0}.dtype, copy=False)",
     }

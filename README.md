@@ -7,7 +7,7 @@ kompilatory i mały zestaw narzędzi do uczenia sieci. Runtime wymaga tylko NumP
 
 Cały IR ma pięć operacji:
 
-1. `ELEMENTWISE` — m.in. add, mul, exp, log i ReLU jako warianty jednej operacji,
+1. `ELEMENTWISE` — m.in. add, mul, exp, log, sqrt i ReLU jako warianty jednej operacji,
 2. `REDUCE` — sum/max,
 3. `RESHAPE`,
 4. `PERMUTE`,
@@ -157,3 +157,40 @@ Na M1 Max, FP32 i `batch=1` mediana dziesięciu rozgrzanych forwardów wyniosła
 32,83 ms dla Chomika oraz 40,38 ms dla tinygrad. Pierwszy forward trwał
 odpowiednio 0,62 s i 2,63 s. Jest to prefill syntetycznych hidden states, a nie
 autoregresywne generowanie z KV cache.
+
+## Pełne generowanie realnym modelem 1.1B
+
+Przykład `generate_tinyllama.py` uruchamia prawdziwy
+`TinyLlama/TinyLlama-1.1B-Chat-v1.0`: pobiera przypiętą rewizję wag, renderuje
+chat template, tokenizuje prompt, wykonuje embedding, 22 bloki Llama, LM head,
+greedy decoding albo sampling i dekoduje odpowiedź. Wagi mają 1 100 048 384
+parametry BF16 i pozostają w natywnej pamięci MLX.
+
+```bash
+.venv/bin/python -m pip install '.[llm,mlx]'
+.venv/bin/python examples/generate_tinyllama.py
+.venv/bin/python examples/generate_tinyllama.py \
+  --prompt 'Explain lazy execution in one sentence.' \
+  --temperature 0.7 --top-k 50 --max-new-tokens 32
+```
+
+Pierwsze uruchomienie pobiera około 2,2 GB do standardowego cache Hugging Face;
+wagi nie trafiają do repozytorium. Rewizja modelu jest przypięta do
+`fe8a4ea1ffedaf415f4da2f062534de366a451e6`, aby przykład był powtarzalny.
+
+Prefill tworzy cache K/V, a każdy kolejny krok aktualizuje go maską. Embedding,
+RoPE, grouped-query attention, RMSNorm, SiLU, cache K/V i wybór ostatniej pozycji
+nadal składają się wyłącznie z pięciu instrukcji IR opisanych wyżej.
+
+Dla domyślnego promptu model generuje:
+
+```text
+The capital of France is Paris.
+```
+
+Na Apple M1 Max mediana pięciu osobnych uruchomień wyniosła 0,19 s do pierwszego
+tokenu i 46,2 tokenu/s dla rozgrzanych kroków decode; szczyt użycia GPU wyniósł
+około 2,16 GiB. Osiem identyfikatorów wygenerowanych tokenów jest identycznych
+z niezależnym wynikiem MLX-LM 0.31.3. MLX-LM jest wyspecjalizowanym runtime'em i
+osiągał w tym samym teście około 144 tokenów/s po rozgrzaniu; Chomik pozostaje
+celowo małym, czytelnym frameworkiem ogólnego przeznaczenia.

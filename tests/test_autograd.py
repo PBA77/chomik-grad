@@ -6,6 +6,13 @@ from chomikgrad import Tensor, cross_entropy
 
 
 class AutogradTests(unittest.TestCase):
+    def test_sqrt_value_and_gradient(self) -> None:
+        value = Tensor(np.array([4.0], dtype=np.float32), requires_grad=True)
+        result = value.sqrt().sum()
+        result.backward()
+        np.testing.assert_allclose(result.numpy(), 2.0)
+        np.testing.assert_allclose(value.grad.numpy(), [0.25])
+
     def test_broadcast_gradient_is_reduced_to_input_shape(self) -> None:
         inputs = Tensor(
             [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],

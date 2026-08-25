@@ -28,7 +28,16 @@ class MLXProgram(CompiledProgram):
 
     def __call__(self) -> Tuple[np.ndarray, ...]:
         outputs = self.run_native()
-        return tuple(np.array(output) for output in outputs)
+        # NumPy has no native BF16 buffer format. Only explicit CPU readback is
+        # widened; the compiled graph and cached parameters remain BF16 on GPU.
+        return tuple(
+            np.array(
+                output.astype(self._mx.float32)
+                if output.dtype == self._mx.bfloat16
+                else output
+            )
+            for output in outputs
+        )
 
 
 class MLXCompiler(Compiler):
@@ -45,6 +54,7 @@ class MLXCompiler(Compiler):
         "neg": "mx.negative({0})",
         "exp": "mx.exp({0})",
         "log": "mx.log({0})",
+        "sqrt": "mx.sqrt({0})",
         "relu": "mx.maximum({0}, 0)",
         "step": "mx.greater({0}, 0).astype({0}.dtype)",
     }
