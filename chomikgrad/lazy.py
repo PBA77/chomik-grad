@@ -186,7 +186,13 @@ class Compiler(ABC):
         parameters: Sequence[LazyNode],
         gradients: Sequence[LazyNode],
         learning_rate: float,
+        *,
+        inplace: bool = False,
     ) -> Optional[Tuple[Tuple[LazyNode, ...], Tuple[LazyNode, ...]]]:
+        if inplace:
+            raise RuntimeError(
+                "this compiler does not support in-place parameter updates"
+            )
         return None
 
 

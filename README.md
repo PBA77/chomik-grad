@@ -36,6 +36,17 @@ loss.backward()                    # powstaje lazy graf gradientów
 optimizer.step()                   # kompilacja i wykonanie na CPU
 ```
 
+CUDA SGD może opcjonalnie aktualizować istniejący storage parametrów:
+
+```python
+optimizer = SGD(model.parameters(), lr=0.1, inplace=True)
+optimizer.step(compiler="cuda")
+```
+
+Domyślne `inplace=False` zachowuje snapshot wag używany przez wcześniej
+zbudowane lazy grafy. Tryb in-place zmniejsza peak pamięci, ale takie stare
+grafy widzą już zaktualizowane wagi.
+
 Domyślnie `Tensor(np_array)` posiada własną kopię danych. Dla świeżych lub
 niemutowanych tablic można jawnie użyć `Tensor(np_array, copy=False)`, aby
 pominąć dodatkową kopię w RAM. Backend MLX nie cache'uje wtedy wejścia i
@@ -267,20 +278,21 @@ Na NVIDIA GeForce RTX 5070 Ti (`CuPy 14.2.0`, `tinygrad 0.14.0`,
 
 | przypadek | Chomik CUDA | tinygrad CUDA | PyTorch eager | PyTorch compile/CUDA Graphs |
 |---|---:|---:|---:|---:|
-| elementwise, 1M | 1,621 ms | 2,930 ms | **0,984 ms** | 1,011 ms |
-| reduce sum, 4M | 1,314 ms | 1,963 ms | **0,934 ms** | 0,995 ms |
-| softmax, 1024×1024 | 1,321 ms | 2,685 ms | **0,680 ms** | 0,765 ms |
-| matmul, 64×64 | 0,217 ms | 2,353 ms | **0,107 ms** | 0,180 ms |
-| matmul, 256×256 | 0,283 ms | 2,448 ms | **0,180 ms** | 0,247 ms |
-| matmul, 1024×1024 | 1,507 ms | 3,922 ms | **0,976 ms** | 1,080 ms |
-| matmul, 2048×2048 | 6,354 ms | 10,056 ms | **4,091 ms** | 4,211 ms |
-| batched matmul, 16×4×64 | 0,612 ms | 2,989 ms | **0,366 ms** | 0,442 ms |
-| trening MLP, 20 epok | 0,593 s | 1,241 s | **0,251 s** | 0,282 s |
-| trening transformera, 10 epok | 2,257 s | 1,737 s | **1,000 s** | 1,212 s |
+| elementwise, 1M | 1,554 ms | 2,767 ms | **0,971 ms** | 1,241 ms |
+| reduce sum, 4M | 1,295 ms | 1,965 ms | **0,925 ms** | 1,422 ms |
+| softmax, 1024×1024 | 1,248 ms | 2,689 ms | **0,656 ms** | 0,825 ms |
+| matmul, 64×64 | 0,116 ms | 2,301 ms | **0,108 ms** | 0,187 ms |
+| matmul, 256×256 | 0,215 ms | 2,385 ms | **0,186 ms** | 0,246 ms |
+| matmul, 1024×1024 | 1,607 ms | 3,876 ms | **0,980 ms** | 1,281 ms |
+| matmul, 2048×2048 | 6,689 ms | 9,948 ms | **3,981 ms** | 4,362 ms |
+| batched matmul, 16×4×64 | 0,667 ms | 2,921 ms | **0,367 ms** | 0,541 ms |
+| trening MLP, 20 epok | 0,563 s | 1,233 s | **0,253 s** | 0,375 s |
+| trening transformera, 10 epok | 1,682 s | 1,722 s | **1,007 s** | 1,718 s |
 
 PyTorch eager wygrał wszystkie dziesięć przypadków. Kontrole fingerprintów i
 accuracy przeszły dla wszystkich frameworków. Mikrobenchmarki obejmują transfer
-wejścia z NumPy na GPU oraz odczyt wyniku z powrotem do NumPy.
+wejścia z NumPy na GPU oraz odczyt wyniku z powrotem do NumPy. Fused backward
+softmax i LayerNorm skrócił trening transformera z 2,257 s do 1,682 s.
 
 ### Inference rdzenia LLM około 1B
 
@@ -327,25 +339,31 @@ normalizacji:
 
 ```bash
 python benchmarks/llm_1b_training.py --steps 12
-python benchmarks/llm_1b_training.py --steps 12 --json
+python benchmarks/llm_1b_training.py --steps 12 --inplace-sgd
+python benchmarks/llm_1b_training.py --steps 12 --inplace-sgd --json
 ```
 
 Na RTX 5070 Ti, FP32, `batch=1` i sekwencji 32 oba frameworki ukończyły 12
-kroków bez OOM:
+kroków bez OOM. Poniższy przebieg używa `--inplace-sgd` dla Chomika:
 
 | metryka | Chomik CUDA | PyTorch eager |
 |---|---:|---:|
-| inicjalizacja modelu | 6,602 s | **6,513 s** |
-| materializacja wag Chomika na GPU | 0,387 s | — |
-| pierwszy `forward + backward + SGD` | 335,8 ms | **283,4 ms** |
-| mediana 11 rozgrzanych kroków | 91,1 ms | **53,9 ms** |
-| peak RAM procesu | 4591,3 MiB | **1186,4 MiB** |
-| pamięć GPU raportowana przez runtime | 11911,4 MiB | **7750,4 MiB** |
+| inicjalizacja modelu | 6,533 s | **6,485 s** |
+| materializacja wag Chomika na GPU | 0,372 s | — |
+| pierwszy `forward + backward + SGD` | **272,9 ms** | 293,6 ms |
+| mediana 11 rozgrzanych kroków | 65,4 ms | **51,9 ms** |
+| peak RAM procesu | 4588,1 MiB | **1186,6 MiB** |
+| pamięć GPU raportowana przez runtime | 7795,4 MiB | **7750,4 MiB** |
 
 Optymalizacja usuwa redukcje po osiach długości jeden, kieruje singleton-batch
-do 2D GEMM, upraszcza grafy gradientów softmax i LayerNorm oraz scala aktualizację
-SGD w jeden kernel. Pierwszy krok Chomika skrócił się z 479 ms do 336 ms; warm
-pozostaje 1,69× wolniejszy od PyTorch i zużywa 1,54× więcej pamięci GPU.
+do 2D GEMM, scala backward softmax do jednego kernela, scala trzy gradienty
+LayerNorm we wspólne wywołanie CUDA oraz wykonuje aktualizację SGD jednym
+kernelem. Względem poprzedniego pomiaru pierwszy krok Chomika skrócił się
+z 335,8 ms do 272,9 ms, a warm step z 91,1 ms do 65,4 ms, czyli o 28,2%.
+Analiza czasu życia buforów zwalnia wyniki po ostatnim użyciu i obniżyła peak
+domyślnego trybu z 11817,8 MiB do 11635,7 MiB. Opcjonalny in-place SGD usuwa
+kopię nowych wag i obniża peak dalej do 7795,4 MiB, tylko o 45,0 MiB (0,6%)
+więcej od PyTorch. Warm step Chomika pozostaje o 26,1% wolniejszy.
 
 ## Pełne generowanie realnym modelem 1.1B
 

@@ -69,7 +69,11 @@ class CUDAProgram(CompiledProgram):
 class CUDACompiler(Compiler):
     """Translate the portable six-operation IR to CuPy on an NVIDIA GPU."""
 
-    _SUPPORTED_LOWERINGS = {"layer_norm"}
+    _SUPPORTED_LOWERINGS = {
+        "layer_norm",
+        "layer_norm_backward",
+        "softmax_backward",
+    }
     _LAYER_NORM_SOURCE = r"""
 extern "C" __global__ void layer_norm(
     const float* inputs,
@@ -95,6 +99,7 @@ extern "C" __global__ void layer_norm(
         __syncthreads();
     }
     const float mean = values[0] / width;
+    __syncthreads();
 
     float squared_sum = 0.0f;
     for (int column = thread; column < width; column += blockDim.x) {
@@ -113,6 +118,119 @@ extern "C" __global__ void layer_norm(
         outputs[offset + column] =
             (inputs[offset + column] - mean) * inverse_std * weight[column]
             + bias[column];
+    }
+}
+"""
+    _SOFTMAX_BACKWARD_SOURCE = r"""
+extern "C" __global__ void softmax_backward(
+    const float* gradients,
+    const float* outputs,
+    float* input_gradients,
+    const int width
+) {
+    const int row = blockIdx.x;
+    const int thread = threadIdx.x;
+    const int offset = row * width;
+    __shared__ float values[256];
+
+    float projection = 0.0f;
+    for (int column = thread; column < width; column += blockDim.x) {
+        projection += gradients[offset + column] * outputs[offset + column];
+    }
+    values[thread] = projection;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (thread < stride) values[thread] += values[thread + stride];
+        __syncthreads();
+    }
+    projection = values[0];
+
+    for (int column = thread; column < width; column += blockDim.x) {
+        const int index = offset + column;
+        input_gradients[index] =
+            outputs[index] * (gradients[index] - projection);
+    }
+}
+"""
+    _LAYER_NORM_BACKWARD_SOURCE = r"""
+extern "C" __global__ void layer_norm_backward(
+    const float* gradients,
+    const float* inputs,
+    const float* weight,
+    float* input_gradients,
+    float* weight_gradients,
+    float* bias_gradients,
+    const int width,
+    const float epsilon
+) {
+    const int row = blockIdx.x;
+    const int thread = threadIdx.x;
+    const int offset = row * width;
+    __shared__ float values[256];
+
+    float sum = 0.0f;
+    for (int column = thread; column < width; column += blockDim.x) {
+        sum += inputs[offset + column];
+    }
+    values[thread] = sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (thread < stride) values[thread] += values[thread + stride];
+        __syncthreads();
+    }
+    const float mean = values[0] / width;
+    __syncthreads();
+
+    float squared_sum = 0.0f;
+    for (int column = thread; column < width; column += blockDim.x) {
+        const float centered = inputs[offset + column] - mean;
+        squared_sum += centered * centered;
+    }
+    values[thread] = squared_sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (thread < stride) values[thread] += values[thread + stride];
+        __syncthreads();
+    }
+    const float inverse_std = rsqrtf(values[0] / width + epsilon);
+    __syncthreads();
+
+    float weighted_sum = 0.0f;
+    float correlation_sum = 0.0f;
+    for (int column = thread; column < width; column += blockDim.x) {
+        const int index = offset + column;
+        const float normalized = (inputs[index] - mean) * inverse_std;
+        const float weighted = gradients[index] * weight[column];
+        weighted_sum += weighted;
+        correlation_sum += weighted * normalized;
+    }
+    values[thread] = weighted_sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (thread < stride) values[thread] += values[thread + stride];
+        __syncthreads();
+    }
+    const float weighted_mean = values[0] / width;
+    __syncthreads();
+
+    values[thread] = correlation_sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (thread < stride) values[thread] += values[thread + stride];
+        __syncthreads();
+    }
+    const float correlation_mean = values[0] / width;
+
+    for (int column = thread; column < width; column += blockDim.x) {
+        const int index = offset + column;
+        const float normalized = (inputs[index] - mean) * inverse_std;
+        const float gradient = gradients[index];
+        const float weighted = gradient * weight[column];
+        input_gradients[index] = (
+            weighted - weighted_mean - normalized * correlation_mean
+        ) * inverse_std;
+        atomicAdd(weight_gradients + column, gradient * normalized);
+        atomicAdd(bias_gradients + column, gradient);
     }
 }
 """
@@ -154,6 +272,8 @@ extern "C" __global__ void layer_norm(
         self.device = CUDADeviceAdapter(cp)
         self._program_cache: Dict[object, Tuple[str, Callable[..., Any]]] = {}
         self._layer_norm_kernel: Optional[Any] = None
+        self._layer_norm_backward_kernel: Optional[Any] = None
+        self._softmax_backward_kernel: Optional[Any] = None
         self._sgd_update_kernel: Optional[Any] = None
 
     @property
@@ -259,14 +379,57 @@ extern "C" __global__ void layer_norm(
 
         names = {node: f"v{index}" for index, node in enumerate(nodes)}
         leaf_indexes = {node: index for index, node in enumerate(leaves)}
+        last_uses: Dict[LazyNode, int] = {}
+        bundle_last_uses: Dict[object, int] = {}
+        for index, node in enumerate(nodes):
+            for parent in self._node_inputs(node):
+                last_uses[parent] = index
+            if (
+                node.lowering is not None
+                and node.lowering[0] == "layer_norm_backward"
+            ):
+                _, lowering_inputs, argument = node.lowering
+                epsilon, _ = argument
+                bundle_last_uses[(lowering_inputs, float(epsilon))] = index
+        for output in outputs:
+            last_uses[output] = len(nodes)
+        releases: Dict[int, list[str]] = {}
+        for node, index in last_uses.items():
+            if index < len(nodes):
+                releases.setdefault(index, []).append(names[node])
+
         lines = ["def run(inputs):"]
-        for node in nodes:
+        lowering_bundles: Dict[object, str] = {}
+        for index, node in enumerate(nodes):
             name = names[node]
             if node.op is None:
                 lines.append(f"    {name} = inputs[{leaf_indexes[node]}]")
                 continue
             args = [names[parent] for parent in self._node_inputs(node)]
-            lines.append(f"    {name} = {self._expression(node, args)}")
+            if (
+                node.lowering is not None
+                and node.lowering[0] == "layer_norm_backward"
+            ):
+                _, lowering_inputs, argument = node.lowering
+                epsilon, component = argument
+                key = (lowering_inputs, float(epsilon))
+                bundle = lowering_bundles.get(key)
+                if bundle is None:
+                    bundle = f"{name}_bundle"
+                    lowering_bundles[key] = bundle
+                    lines.append(
+                        f"    {bundle} = layer_norm_backward("
+                        f"{args[0]}, {args[1]}, {args[2]}, "
+                        f"{float(epsilon)!r})"
+                    )
+                lines.append(f"    {name} = {bundle}[{int(component)}]")
+                if bundle_last_uses[key] == index:
+                    lines.append(f"    del {bundle}")
+            else:
+                lines.append(f"    {name} = {self._expression(node, args)}")
+            released = releases.get(index)
+            if released:
+                lines.append(f"    del {', '.join(released)}")
 
         rendered_outputs = ", ".join(names[node] for node in outputs)
         if len(outputs) == 1:
@@ -277,7 +440,12 @@ extern "C" __global__ void layer_norm(
         namespace: Dict[str, object] = {}
         exec(
             compile(source, "<chomikgrad-cuda>", "exec"),
-            {"cp": self._cp, "layer_norm": self._layer_norm},
+            {
+                "cp": self._cp,
+                "layer_norm": self._layer_norm,
+                "layer_norm_backward": self._layer_norm_backward,
+                "softmax_backward": self._softmax_backward,
+            },
             namespace,
         )
         raw_run = namespace["run"]
@@ -314,11 +482,18 @@ extern "C" __global__ void layer_norm(
         parameters: Sequence[LazyNode],
         gradients: Sequence[LazyNode],
         learning_rate: float,
+        *,
+        inplace: bool = False,
     ) -> Tuple[Tuple[LazyNode, ...], Tuple[LazyNode, ...]]:
         native_gradients = self.compile(gradients).run(synchronize=False)
         native_parameters = [self._load_input(node) for node in parameters]
         updated = tuple(
-            self._update_parameter(parameter, gradient, learning_rate)
+            self._update_parameter(
+                parameter,
+                gradient,
+                learning_rate,
+                inplace=inplace,
+            )
             for parameter, gradient in zip(native_parameters, native_gradients)
         )
         parameter_nodes = tuple(
@@ -336,6 +511,8 @@ extern "C" __global__ void layer_norm(
         parameter: Any,
         gradient: Any,
         learning_rate: float,
+        *,
+        inplace: bool = False,
     ) -> Any:
         cp = self._cp
         if self._sgd_update_kernel is None:
@@ -345,11 +522,15 @@ extern "C" __global__ void layer_norm(
                 "updated = parameter - learning_rate * gradient",
                 "chomik_sgd_update",
             )
-        return self._sgd_update_kernel(
+        arguments = (
             parameter,
             gradient,
             parameter.dtype.type(learning_rate),
         )
+        if inplace:
+            self._sgd_update_kernel(*arguments, parameter)
+            return parameter
+        return self._sgd_update_kernel(*arguments)
 
     def _expression(self, node: LazyNode, args: Sequence[str]) -> str:
         if node.lowering is not None and node.lowering[0] in self._SUPPORTED_LOWERINGS:
@@ -358,6 +539,15 @@ extern "C" __global__ void layer_norm(
                 return (
                     f"layer_norm({args[0]}, {args[1]}, {args[2]}, "
                     f"{float(argument)!r})"
+                )
+            if kind == "softmax_backward":
+                return (
+                    f"softmax_backward({args[0]}, {args[1]}, "
+                    f"{int(argument)!r})"
+                )
+            if kind == "layer_norm_backward":
+                raise RuntimeError(
+                    "layer_norm_backward must be emitted as a shared bundle"
                 )
             raise ValueError(f"unsupported CUDA lowering: {kind}")
 
@@ -439,3 +629,98 @@ extern "C" __global__ void layer_norm(
             (inputs, weight, bias, output, np.int32(width), np.float32(epsilon)),
         )
         return output
+
+    def _softmax_backward(
+        self,
+        gradients: Any,
+        outputs: Any,
+        axis: int,
+    ) -> Any:
+        cp = self._cp
+        if (
+            axis != gradients.ndim - 1
+            or gradients.dtype != cp.float32
+            or outputs.dtype != cp.float32
+            or not gradients.flags.c_contiguous
+            or not outputs.flags.c_contiguous
+            or gradients.size == 0
+        ):
+            weighted = gradients * outputs
+            projection = cp.sum(weighted, axis=axis, keepdims=True)
+            return outputs * (gradients - projection)
+
+        if self._softmax_backward_kernel is None:
+            self._softmax_backward_kernel = cp.RawKernel(
+                self._SOFTMAX_BACKWARD_SOURCE,
+                "softmax_backward",
+            )
+        input_gradients = cp.empty_like(gradients)
+        width = gradients.shape[-1]
+        rows = gradients.size // width
+        self._softmax_backward_kernel(
+            (rows,),
+            (256,),
+            (gradients, outputs, input_gradients, np.int32(width)),
+        )
+        return input_gradients
+
+    def _layer_norm_backward(
+        self,
+        gradients: Any,
+        inputs: Any,
+        weight: Any,
+        epsilon: float,
+    ) -> Tuple[Any, Any, Any]:
+        cp = self._cp
+        if (
+            gradients.dtype != cp.float32
+            or inputs.dtype != cp.float32
+            or weight.dtype != cp.float32
+            or not gradients.flags.c_contiguous
+            or not inputs.flags.c_contiguous
+            or not weight.flags.c_contiguous
+            or inputs.size == 0
+        ):
+            mean = cp.mean(inputs, axis=-1, keepdims=True)
+            centered = inputs - mean
+            variance = cp.mean(centered * centered, axis=-1, keepdims=True)
+            inverse_std = 1.0 / cp.sqrt(variance + epsilon)
+            normalized = centered * inverse_std
+            weighted = gradients * weight
+            input_gradients = (
+                weighted
+                - cp.mean(weighted, axis=-1, keepdims=True)
+                - normalized
+                * cp.mean(weighted * normalized, axis=-1, keepdims=True)
+            ) * inverse_std
+            rows = gradients.reshape((-1, gradients.shape[-1]))
+            normalized_rows = normalized.reshape(rows.shape)
+            weight_gradients = cp.sum(rows * normalized_rows, axis=0)
+            bias_gradients = cp.sum(rows, axis=0)
+            return input_gradients, weight_gradients, bias_gradients
+
+        if self._layer_norm_backward_kernel is None:
+            self._layer_norm_backward_kernel = cp.RawKernel(
+                self._LAYER_NORM_BACKWARD_SOURCE,
+                "layer_norm_backward",
+            )
+        input_gradients = cp.empty_like(inputs)
+        weight_gradients = cp.zeros_like(weight)
+        bias_gradients = cp.zeros_like(weight)
+        width = inputs.shape[-1]
+        rows = inputs.size // width
+        self._layer_norm_backward_kernel(
+            (rows,),
+            (256,),
+            (
+                gradients,
+                inputs,
+                weight,
+                input_gradients,
+                weight_gradients,
+                bias_gradients,
+                np.int32(width),
+                np.float32(epsilon),
+            ),
+        )
+        return input_gradients, weight_gradients, bias_gradients

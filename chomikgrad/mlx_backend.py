@@ -272,11 +272,31 @@ class MLXCompiler(Compiler):
         names = {node: f"v{index}" for index, node in enumerate(nodes)}
         leaf_indexes = {node: index for index, node in enumerate(leaves)}
         lines = ["def run(inputs):"]
+        lowering_bundles: Dict[object, str] = {}
 
         for node in nodes:
             name = names[node]
             if node.op is None:
                 lines.append(f"    {name} = inputs[{leaf_indexes[node]}]")
+                continue
+            if (
+                node.lowering is not None
+                and node.lowering[0] == "layer_norm_backward"
+            ):
+                _, lowering_inputs, argument = node.lowering
+                epsilon, component = argument
+                key = (lowering_inputs, float(epsilon))
+                bundle = lowering_bundles.get(key)
+                if bundle is None:
+                    bundle = f"{name}_bundle"
+                    lowering_bundles[key] = bundle
+                    lowered = [names[parent] for parent in lowering_inputs]
+                    lines.append(
+                        f"    {bundle} = layer_norm_backward("
+                        f"{lowered[0]}, {lowered[1]}, {lowered[2]}, "
+                        f"{float(epsilon)!r})"
+                    )
+                lines.append(f"    {name} = {bundle}[{int(component)}]")
                 continue
             args = (
                 []
@@ -296,7 +316,12 @@ class MLXCompiler(Compiler):
         namespace: Dict[str, object] = {}
         exec(
             compile(source, "<chomikgrad-mlx>", "exec"),
-            {"mx": self._mx, "layer_norm": self._layer_norm},
+            {
+                "mx": self._mx,
+                "layer_norm": self._layer_norm,
+                "layer_norm_backward": self._layer_norm_backward,
+                "softmax_backward": self._softmax_backward,
+            },
             namespace,
         )
         raw_run = namespace["run"]
@@ -333,7 +358,13 @@ class MLXCompiler(Compiler):
         parameters: Sequence[LazyNode],
         gradients: Sequence[LazyNode],
         learning_rate: float,
+        *,
+        inplace: bool = False,
     ) -> Tuple[Tuple[LazyNode, ...], Tuple[LazyNode, ...]]:
+        if inplace:
+            raise RuntimeError(
+                "the MLX backend does not support in-place parameter updates"
+            )
         native_gradients = self.compile(gradients).run(synchronize=False)
         native_parameters = [self._load_input(node) for node in parameters]
         gpu = self._mx.Device(self._mx.gpu, 0)
@@ -366,6 +397,15 @@ class MLXCompiler(Compiler):
                 return (
                     f"layer_norm({lowered[0]}, {lowered[1]}, {lowered[2]}, "
                     f"{float(argument)!r})"
+                )
+            if kind == "softmax_backward":
+                return (
+                    f"softmax_backward({lowered[0]}, {lowered[1]}, "
+                    f"{int(argument)!r})"
+                )
+            if kind == "layer_norm_backward":
+                raise RuntimeError(
+                    "layer_norm_backward must be emitted as a shared bundle"
                 )
             if kind == "rms_norm":
                 return (
@@ -427,3 +467,39 @@ class MLXCompiler(Compiler):
         centered = inputs - mean
         variance = self._mx.mean(centered * centered, axis=-1, keepdims=True)
         return centered / self._mx.sqrt(variance + epsilon) * weight + bias
+
+    def _softmax_backward(
+        self,
+        gradients: Any,
+        outputs: Any,
+        axis: int,
+    ) -> Any:
+        weighted = gradients * outputs
+        projection = self._mx.sum(weighted, axis=axis, keepdims=True)
+        return outputs * (gradients - projection)
+
+    def _layer_norm_backward(
+        self,
+        gradients: Any,
+        inputs: Any,
+        weight: Any,
+        epsilon: float,
+    ) -> Tuple[Any, Any, Any]:
+        mx = self._mx
+        mean = mx.mean(inputs, axis=-1, keepdims=True)
+        centered = inputs - mean
+        variance = mx.mean(centered * centered, axis=-1, keepdims=True)
+        inverse_std = 1.0 / mx.sqrt(variance + epsilon)
+        normalized = centered * inverse_std
+        weighted = gradients * weight
+        input_gradients = (
+            weighted
+            - mx.mean(weighted, axis=-1, keepdims=True)
+            - normalized
+            * mx.mean(weighted * normalized, axis=-1, keepdims=True)
+        ) * inverse_std
+        rows = mx.reshape(gradients, (-1, gradients.shape[-1]))
+        normalized_rows = mx.reshape(normalized, rows.shape)
+        weight_gradients = mx.sum(rows * normalized_rows, axis=0)
+        bias_gradients = mx.sum(rows, axis=0)
+        return input_gradients, weight_gradients, bias_gradients

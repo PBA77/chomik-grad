@@ -165,7 +165,11 @@ def run_worker(arguments: argparse.Namespace) -> Dict[str, object]:
     inputs = adapter.input(rng.standard_normal(shape, dtype=np.float32))
     target = adapter.input(rng.standard_normal(shape, dtype=np.float32))
     optimizer = (
-        adapter.SGD(adapter.parameters, lr=arguments.learning_rate)
+        adapter.SGD(
+            adapter.parameters,
+            lr=arguments.learning_rate,
+            inplace=arguments.inplace_sgd,
+        )
         if framework == "chomik"
         else adapter.torch.optim.SGD(
             adapter.parameters, lr=arguments.learning_rate
@@ -242,6 +246,8 @@ def run_subprocess(framework: str, arguments: argparse.Namespace) -> Dict[str, o
         "--seed",
         str(arguments.seed),
     ]
+    if arguments.inplace_sgd:
+        command.append("--inplace-sgd")
     completed = subprocess.run(
         command,
         cwd=ROOT,
@@ -283,6 +289,7 @@ def compare(arguments: argparse.Namespace) -> Dict[str, object]:
             "batch": arguments.batch,
             "steps": arguments.steps,
             "learning_rate": arguments.learning_rate,
+            "inplace_sgd": arguments.inplace_sgd,
         },
         "frameworks": {"chomik": chomik, "torch-eager": torch},
         "winner": min(
@@ -304,7 +311,8 @@ def print_result(result: Dict[str, object]) -> None:
         f"layers={configuration['layers']} width={configuration['width']} "
         f"heads={configuration['heads']} hidden={configuration['hidden']} "
         f"sequence={configuration['sequence']} batch={configuration['batch']} "
-        f"steps={configuration['steps']}"
+        f"steps={configuration['steps']} "
+        f"inplace_sgd={configuration['inplace_sgd']}"
     )
     print("framework,init_s,materialize_s,first_step_s,warm_step_s,ram_mib,gpu_mib")
     for framework in frameworks.values():
@@ -330,6 +338,11 @@ def main() -> None:
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--steps", type=int, default=7)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument(
+        "--inplace-sgd",
+        action="store_true",
+        help="update Chomik CUDA parameters in place to reduce peak memory",
+    )
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--json", action="store_true")
     parser.add_argument(

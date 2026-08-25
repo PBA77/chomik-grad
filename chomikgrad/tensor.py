@@ -334,7 +334,14 @@ class Tensor:
         def backward(grad: Tensor) -> BackwardResult:
             weighted = grad * result
             projection = weighted.sum(axis=axis, keepdims=True)
-            return ((self, result * (grad - projection)),)
+            contribution = result * (grad - projection)
+            normalized_axis = _normalize_axes(axis, self.ndim)[0]
+            contribution._node.lowering = (
+                "softmax_backward",
+                (grad._node, result._node),
+                normalized_axis,
+            )
+            return ((self, contribution),)
 
         result._backward = backward
         return result
@@ -374,6 +381,7 @@ class Tensor:
 
         def backward(grad: Tensor) -> BackwardResult:
             contributions = []
+            lowering_inputs = (grad._node, self._node, weight._node)
             if self.requires_grad:
                 weighted = grad * weight
                 weighted_mean = weighted.mean(axis=-1, keepdims=True)
@@ -383,13 +391,28 @@ class Tensor:
                 input_grad = (
                     weighted - weighted_mean - normalized * correlation
                 ) / standard_deviation
+                input_grad._node.lowering = (
+                    "layer_norm_backward",
+                    lowering_inputs,
+                    (float(epsilon), 0),
+                )
                 contributions.append((self, input_grad))
             if weight.requires_grad:
-                contributions.append(
-                    (weight, (grad * normalized)._unbroadcast(weight.shape))
+                weight_grad = (grad * normalized)._unbroadcast(weight.shape)
+                weight_grad._node.lowering = (
+                    "layer_norm_backward",
+                    lowering_inputs,
+                    (float(epsilon), 1),
                 )
+                contributions.append((weight, weight_grad))
             if bias.requires_grad:
-                contributions.append((bias, grad._unbroadcast(bias.shape)))
+                bias_grad = grad._unbroadcast(bias.shape)
+                bias_grad._node.lowering = (
+                    "layer_norm_backward",
+                    lowering_inputs,
+                    (float(epsilon), 2),
+                )
+                contributions.append((bias, bias_grad))
             return contributions
 
         result._backward = backward

@@ -41,6 +41,7 @@ class CUDABackendTests(unittest.TestCase):
         )
         self.assertIn("cp.matmul", program.source)
         self.assertIn("cp.transpose", program.source)
+        self.assertIn("    del ", program.source)
 
         table = Tensor(
             [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=np.float32
@@ -140,6 +141,55 @@ class CUDABackendTests(unittest.TestCase):
         self.assertIn("layer_norm", program.source)
         np.testing.assert_allclose(program()[0], expected, rtol=1e-5, atol=1e-5)
 
+    def test_fused_softmax_backward_matches_portable_graph(self) -> None:
+        rng = np.random.default_rng(29)
+        source = Tensor(
+            rng.normal(size=(3, 5, 64)).astype(np.float32),
+            requires_grad=True,
+        )
+        upstream = Tensor(rng.normal(size=source.shape).astype(np.float32))
+        (source.softmax(axis=-1) * upstream).sum().backward()
+        expected = source.grad.numpy(compiler="cpu")
+
+        program = compile_graph(source.grad, compiler="cuda")
+        self.assertIn("softmax_backward", program.source)
+        np.testing.assert_allclose(
+            program()[0], expected, rtol=1e-5, atol=1e-6
+        )
+
+    def test_fused_layer_norm_backward_matches_portable_graph(self) -> None:
+        rng = np.random.default_rng(31)
+        source = Tensor(
+            rng.normal(size=(3, 5, 64)).astype(np.float32),
+            requires_grad=True,
+        )
+        weight = Tensor(
+            rng.normal(size=64).astype(np.float32),
+            requires_grad=True,
+        )
+        bias = Tensor(
+            rng.normal(size=64).astype(np.float32),
+            requires_grad=True,
+        )
+        upstream = Tensor(rng.normal(size=source.shape).astype(np.float32))
+        (source.layer_norm(weight, bias) * upstream).sum().backward()
+        expected = tuple(
+            gradient.numpy(compiler="cpu")
+            for gradient in (source.grad, weight.grad, bias.grad)
+        )
+
+        program = compile_graph(
+            source.grad,
+            weight.grad,
+            bias.grad,
+            compiler="cuda",
+        )
+        self.assertEqual(program.source.count("layer_norm_backward("), 1)
+        for actual, reference in zip(program(), expected):
+            np.testing.assert_allclose(
+                actual, reference, rtol=2e-5, atol=2e-5
+            )
+
     def test_copy_false_observes_host_mutation(self) -> None:
         source = np.array([1.0, 2.0], dtype=np.float32)
         tensor = Tensor(source, copy=False)
@@ -150,15 +200,47 @@ class CUDABackendTests(unittest.TestCase):
     def test_sgd_keeps_parameters_on_cuda_and_cpu_can_read_them(self) -> None:
         parameter = Parameter(np.array([[1.0], [2.0]], dtype=np.float32))
         inputs = Tensor(np.array([[3.0, 4.0]], dtype=np.float32))
+        old_graph = parameter * 2.0
+        storage_before = compile_graph(parameter, compiler="cuda").run(
+            synchronize=True
+        )[0]
         loss = (inputs @ parameter).sum()
         loss.backward()
         SGD([parameter], lr=0.1).step(compiler="cuda")
 
         self.assertIsNone(parameter._node.value)
         self.assertIn("cuda", parameter._node.native_values)
+        storage_after = parameter._node.native_values["cuda"]
+        self.assertNotEqual(storage_before.data.ptr, storage_after.data.ptr)
         np.testing.assert_allclose(
             parameter.numpy(compiler="cpu"),
             [[0.7], [1.6]],
             rtol=1e-6,
             atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            old_graph.numpy(compiler="cuda"), [[2.0], [4.0]]
+        )
+
+    def test_inplace_sgd_reuses_cuda_parameter_storage(self) -> None:
+        parameter = Parameter(np.array([[1.0], [2.0]], dtype=np.float32))
+        inputs = Tensor(np.array([[3.0, 4.0]], dtype=np.float32))
+        old_graph = parameter * 2.0
+        storage_before = compile_graph(parameter, compiler="cuda").run(
+            synchronize=True
+        )[0]
+        loss = (inputs @ parameter).sum()
+        loss.backward()
+        SGD([parameter], lr=0.1, inplace=True).step(compiler="cuda")
+
+        storage_after = parameter._node.native_values["cuda"]
+        self.assertEqual(storage_before.data.ptr, storage_after.data.ptr)
+        np.testing.assert_allclose(
+            parameter.numpy(compiler="cpu"),
+            [[0.7], [1.6]],
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            old_graph.numpy(compiler="cuda"), [[1.4], [3.2]]
         )

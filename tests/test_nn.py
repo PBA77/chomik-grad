@@ -6,6 +6,12 @@ from chomikgrad import Linear, ReLU, SGD, Sequential, Tensor, cross_entropy
 
 
 class NeuralNetworkTests(unittest.TestCase):
+    def test_inplace_sgd_requires_backend_support(self) -> None:
+        parameter = Linear(1, 1).weight
+        parameter.grad = Tensor(np.ones(parameter.shape, dtype=np.float32))
+        with self.assertRaisesRegex(RuntimeError, "does not support in-place"):
+            SGD([parameter], inplace=True).step(compiler="cpu")
+
     def test_optimizer_learns_small_multiclass_problem(self) -> None:
         rng = np.random.default_rng(7)
         features = np.array(

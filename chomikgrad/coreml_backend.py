@@ -308,6 +308,8 @@ class CoreMLCompiler(Compiler):
         parameters: Sequence[LazyNode],
         gradients: Sequence[LazyNode],
         learning_rate: float,
+        *,
+        inplace: bool = False,
     ) -> None:
         raise RuntimeError("the Core ML backend is inference-only")
 

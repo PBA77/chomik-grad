@@ -8,11 +8,18 @@ from .tensor import Tensor, realize
 
 
 class SGD:
-    def __init__(self, parameters: Iterable[Parameter], lr: float = 0.01) -> None:
+    def __init__(
+        self,
+        parameters: Iterable[Parameter],
+        lr: float = 0.01,
+        *,
+        inplace: bool = False,
+    ) -> None:
         if lr <= 0:
             raise ValueError("learning rate must be positive")
         self.parameters: List[Parameter] = list(parameters)
         self.lr = float(lr)
+        self.inplace = bool(inplace)
 
     def zero_grad(self) -> None:
         for parameter in self.parameters:
@@ -23,10 +30,21 @@ class SGD:
         if not active:
             return
         selected = get_compiler(compiler)
-        native_update = selected.update_parameters(
-            [parameter._node for parameter in active],
-            [parameter.grad._node for parameter in active if parameter.grad is not None],
-            self.lr,
+        parameters = [parameter._node for parameter in active]
+        gradients = [
+            parameter.grad._node
+            for parameter in active
+            if parameter.grad is not None
+        ]
+        native_update = (
+            selected.update_parameters(
+                parameters,
+                gradients,
+                self.lr,
+                inplace=True,
+            )
+            if self.inplace
+            else selected.update_parameters(parameters, gradients, self.lr)
         )
         if native_update is not None:
             parameter_nodes, gradient_nodes = native_update
