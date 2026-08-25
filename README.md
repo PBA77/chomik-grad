@@ -35,6 +35,11 @@ loss.backward()                    # powstaje lazy graf gradientów
 optimizer.step()                   # kompilacja i wykonanie na CPU
 ```
 
+Domyślnie `Tensor(np_array)` posiada własną kopię danych. Dla świeżych lub
+niemutowanych tablic można jawnie użyć `Tensor(np_array, copy=False)`, aby
+pominąć dodatkową kopię w RAM. Backend MLX nie cache'uje wtedy wejścia i
+zauważa późniejsze zmiany źródłowej tablicy.
+
 ## Wtyczka kompilatora
 
 Wtyczka implementuje jedną metodę. Dostaje wyjściowe `LazyNode` i zwraca
@@ -64,7 +69,8 @@ kończy się czytelnym błędem — backend nie przechodzi po cichu na CPU.
 
 Parametry i gradienty pozostają jako natywne tablice MLX na GPU pomiędzy
 krokami. Strukturalnie identyczne grafy korzystają z cache oraz `mx.compile`, a
-SGD aktualizuje parametry bez kopiowania ich przez NumPy. Transfer do RAM-u
+SGD oblicza gradienty i aktualizuje parametry przy jednej synchronizacji GPU,
+bez kopiowania ich przez NumPy. Transfer do RAM-u
 następuje dopiero po jawnym `numpy()`, `item()` albo użyciu kompilatora `cpu`.
 
 MLX wymaga Apple Silicon, macOS 14+ i natywnego Pythona 3.10+. Przykładowa
@@ -101,26 +107,37 @@ python examples/train_digits_transformer.py --compiler cpu
 .venv/bin/python examples/train_digits_transformer.py --compiler mlx
 ```
 
-## Benchmark transformera względem tinygrad
+## Benchmark względem tinygrad
 
-Skrypt buduje w obu frameworkach tę samą architekturę i zaczyna od tych samych
-wag. Mierzy dziesięć epok treningu bez synchronizacji wyniku loss po każdym
-batchu, a następnie sprawdza accuracy:
+Główny benchmark uruchamia Chomika i tinygrad w osobnych procesach, aby ich
+runtime'y Metal nie wpływały na siebie. Obejmuje osiem operacji tensorowych,
+20 epok MLP i 10 epok transformera. Kontroluje zgodność wyników oraz accuracy;
+nie zawiera niestabilnych progów czasowych:
 
 ```bash
-.venv/bin/python -m pip install tinygrad
-DEV=METAL PYTHONPATH=. .venv/bin/python \
-  benchmarks/transformer_vs_tinygrad.py \
-  --frameworks chomik-cpu chomik-mlx tinygrad --trials 3
+.venv/bin/python -m pip install '.[benchmark]'
+.venv/bin/python benchmarks/compare_tinygrad_10_cases.py --trials 3
+.venv/bin/python benchmarks/compare_tinygrad_10_cases.py --json
 ```
 
-Przykładowy wynik na Apple M1 Max (`tinygrad 0.14.0`, `mlx 0.32.1`):
+Skrypt `benchmarks/transformer_vs_tinygrad.py` pozostaje krótszym benchmarkiem
+samego transformera.
 
-| backend | mediana 10 epok | test accuracy |
+Przykładowy wynik głównego benchmarku na Apple M1 Max (`tinygrad 0.14.0`,
+`mlx 0.32.1`):
+
+| przypadek | Chomik | tinygrad |
 |---|---:|---:|
-| chomik CPU / NumPy | 2,208 s | 77,78% |
-| chomik GPU / MLX Metal | 1,268 s | 77,78% |
-| tinygrad / Metal | 1,444 s | 77,78% |
+| elementwise, 1M | **0,75 ms** | 1,82 ms |
+| reduce sum, 4M | **0,74 ms** | 1,60 ms |
+| softmax, 1024×1024 | **0,65 ms** | 1,95 ms |
+| matmul, 64×64 | **0,29 ms** | 2,41 ms |
+| matmul, 256×256 | **0,33 ms** | 2,46 ms |
+| matmul, 1024×1024 | **1,57 ms** | 3,24 ms |
+| matmul, 2048×2048 | **5,35 ms** | 6,59 ms |
+| batched matmul, 16×4×64 | **0,40 ms** | 2,67 ms |
+| trening MLP, 20 epok | **0,37 s** | 1,06 s |
+| trening transformera, 10 epok | **1,46 s** | 1,63 s |
 
 To mały model, więc wynik mierzy również narzut kompilacji i Pythona. Na innych
 wersjach bibliotek oraz układach Apple proporcje mogą być inne.

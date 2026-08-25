@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Sequence, Tuple
 
@@ -16,12 +17,13 @@ class MLXProgram(CompiledProgram):
     _mx: Any
     _load_input: Callable[[LazyNode], Any]
 
-    def run_native(self) -> Tuple[Any, ...]:
+    def run_native(self, *, evaluate: bool = True) -> Tuple[Any, ...]:
         gpu = self._mx.Device(self._mx.gpu, 0)
         with self._mx.stream(gpu):
             values = [self._load_input(node) for node in self.inputs]
             outputs = self._run(values)
-            self._mx.eval(outputs)
+            if evaluate:
+                self._mx.eval(outputs)
         return tuple(outputs)
 
     def __call__(self) -> Tuple[np.ndarray, ...]:
@@ -59,6 +61,14 @@ class MLXCompiler(Compiler):
             raise RuntimeError("the MLX backend requires an available Metal GPU")
         self._mx = mx
         self._program_cache: Dict[object, Tuple[str, Callable[..., Any]]] = {}
+        atexit.register(self.close)
+
+    def close(self) -> None:
+        if not self._program_cache:
+            return
+        self._mx.synchronize()
+        self._program_cache.clear()
+        self._mx.clear_cache()
 
     @property
     def cache_size(self) -> int:
@@ -73,7 +83,8 @@ class MLXCompiler(Compiler):
                 "MLX does not support float64; create this tensor as float32"
             )
         native = self._mx.array(value)
-        node.native_values["mlx"] = native
+        if node.cache_native:
+            node.native_values["mlx"] = native
         return native
 
     def _signature(
@@ -103,15 +114,15 @@ class MLXCompiler(Compiler):
             raise ValueError("at least one output is required")
 
         nodes = topological_sort(outputs)
-        names = {node: f"v{index}" for index, node in enumerate(nodes)}
         leaves = tuple(node for node in nodes if node.op is None)
-        leaf_indexes = {node: index for index, node in enumerate(leaves)}
         signature = self._signature(nodes, outputs)
         cached = self._program_cache.get(signature)
         if cached is not None:
             source, run = cached
             return MLXProgram(source, leaves, run, self._mx, self._load_input)
 
+        names = {node: f"v{index}" for index, node in enumerate(nodes)}
+        leaf_indexes = {node: index for index, node in enumerate(leaves)}
         lines = ["def run(inputs):"]
 
         for node in nodes:
@@ -150,7 +161,7 @@ class MLXCompiler(Compiler):
         gradients: Sequence[LazyNode],
         learning_rate: float,
     ) -> Tuple[Tuple[LazyNode, ...], Tuple[LazyNode, ...]]:
-        native_gradients = self.compile(gradients).run_native()
+        native_gradients = self.compile(gradients).run_native(evaluate=False)
         native_parameters = [self._load_input(node) for node in parameters]
         gpu = self._mx.Device(self._mx.gpu, 0)
         with self._mx.stream(gpu):

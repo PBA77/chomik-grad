@@ -56,6 +56,16 @@ class LazyExecutionTests(unittest.TestCase):
         np.testing.assert_allclose(old_graph.numpy(), [6.0])
         np.testing.assert_allclose((value * 3.0).numpy(), [15.0])
 
+    def test_copy_false_explicitly_shares_numpy_storage(self) -> None:
+        source = np.array([1.0, 2.0], dtype=np.float32)
+        shared = Tensor(source, copy=False)
+        owned = Tensor(source)
+
+        source[0] = 9.0
+
+        np.testing.assert_allclose(shared.numpy(), [9.0, 2.0])
+        np.testing.assert_allclose(owned.numpy(), [1.0, 2.0])
+
 
 if __name__ == "__main__":
     unittest.main()

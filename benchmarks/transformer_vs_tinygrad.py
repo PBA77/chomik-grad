@@ -46,7 +46,12 @@ def benchmark_chomik(
             indexes = order[start : start + batch_size]
             optimizer.zero_grad()
             loss = cross_entropy(
-                model(Tensor(train_x[indexes].reshape(-1, 8, 8))),
+                model(
+                    Tensor(
+                        train_x[indexes].reshape(-1, 8, 8),
+                        copy=False,
+                    )
+                ),
                 train_y[indexes],
             )
             loss.backward()
@@ -56,7 +61,7 @@ def benchmark_chomik(
 
     with no_grad():
         predictions = (
-            model(Tensor(test_x.reshape(-1, 8, 8)))
+            model(Tensor(test_x.reshape(-1, 8, 8), copy=False))
             .numpy(compiler=compiler)
             .argmax(axis=1)
         )

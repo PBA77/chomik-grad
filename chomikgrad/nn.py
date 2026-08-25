@@ -186,7 +186,7 @@ def cross_entropy(logits: Tensor, targets: Sequence[int]) -> Tensor:
     one_hot = np.zeros(logits.shape, dtype=logits.dtype)
     one_hot[np.arange(logits.shape[0]), labels] = 1
     log_probabilities = logits.log_softmax(axis=1)
-    return -(log_probabilities * Tensor(one_hot)).sum() / logits.shape[0]
+    return -(log_probabilities * Tensor(one_hot, copy=False)).sum() / logits.shape[0]
 
 
 class CrossEntropyLoss(Module):

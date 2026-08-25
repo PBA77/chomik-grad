@@ -16,7 +16,11 @@ def accuracy(
     compiler: str,
 ) -> float:
     with no_grad():
-        predictions = model(Tensor(features)).numpy(compiler=compiler).argmax(axis=1)
+        predictions = (
+            model(Tensor(features, copy=False))
+            .numpy(compiler=compiler)
+            .argmax(axis=1)
+        )
     return float((predictions == labels).mean())
 
 
@@ -46,14 +50,14 @@ def train(epochs: int, batch_size: int, seed: int, compiler: str) -> float:
             indexes = order[start : start + batch_size]
             batch_x, batch_y = train_x[indexes], train_y[indexes]
             optimizer.zero_grad()
-            loss = cross_entropy(model(Tensor(batch_x)), batch_y)
+            loss = cross_entropy(model(Tensor(batch_x, copy=False)), batch_y)
             loss.backward()
             optimizer.step(compiler=compiler)
 
         if epoch == 1 or epoch == epochs or epoch % 5 == 0:
             with no_grad():
                 train_loss = float(
-                    cross_entropy(model(Tensor(train_x)), train_y).item(
+                    cross_entropy(model(Tensor(train_x, copy=False)), train_y).item(
                         compiler=compiler
                     )
                 )

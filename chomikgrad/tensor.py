@@ -53,11 +53,15 @@ class Tensor:
         *,
         requires_grad: bool = False,
         dtype: Optional[np.dtype] = None,
+        copy: bool = True,
     ) -> None:
         value = np.asarray(data, dtype=dtype)
         if requires_grad and not np.issubdtype(value.dtype, np.floating):
             raise TypeError("only floating-point tensors can require gradients")
-        self._node = LazyNode.leaf(value.copy())
+        self._node = LazyNode.leaf(
+            value.copy() if copy else value,
+            cache_native=copy,
+        )
         self.requires_grad = bool(requires_grad)
         self.grad: Optional[Tensor] = None
         self._parents: Tuple[Tensor, ...] = ()
@@ -79,13 +83,13 @@ class Tensor:
     def zeros(
         cls, shape: Sequence[int], *, dtype: np.dtype = np.float32
     ) -> "Tensor":
-        return cls(np.zeros(tuple(shape), dtype=dtype))
+        return cls(np.zeros(tuple(shape), dtype=dtype), copy=False)
 
     @classmethod
     def ones(
         cls, shape: Sequence[int], *, dtype: np.dtype = np.float32
     ) -> "Tensor":
-        return cls(np.ones(tuple(shape), dtype=dtype))
+        return cls(np.ones(tuple(shape), dtype=dtype), copy=False)
 
     @property
     def shape(self) -> Tuple[int, ...]:

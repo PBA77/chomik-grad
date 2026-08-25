@@ -31,6 +31,7 @@ class LazyNode:
         "dtype",
         "value",
         "native_values",
+        "cache_native",
     )
 
     def __init__(
@@ -42,6 +43,7 @@ class LazyNode:
         dtype: np.dtype,
         value: Optional[np.ndarray] = None,
         native_values: Optional[Dict[str, object]] = None,
+        cache_native: bool = True,
     ) -> None:
         self.op = op
         self.inputs = tuple(inputs)
@@ -50,10 +52,19 @@ class LazyNode:
         self.dtype = np.dtype(dtype)
         self.value = value
         self.native_values = native_values or {}
+        self.cache_native = cache_native
 
     @classmethod
-    def leaf(cls, value: np.ndarray) -> "LazyNode":
-        return cls(None, (), None, value.shape, value.dtype, value)
+    def leaf(cls, value: np.ndarray, *, cache_native: bool = True) -> "LazyNode":
+        return cls(
+            None,
+            (),
+            None,
+            value.shape,
+            value.dtype,
+            value,
+            cache_native=cache_native,
+        )
 
     @classmethod
     def native_leaf(

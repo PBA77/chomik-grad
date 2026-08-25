@@ -49,7 +49,7 @@ def accuracy(
     compiler: str,
 ) -> float:
     with no_grad():
-        inputs = Tensor(features.reshape(-1, 8, 8))
+        inputs = Tensor(features.reshape(-1, 8, 8), copy=False)
         predictions = model(inputs).numpy(compiler=compiler).argmax(axis=1)
     return float((predictions == labels).mean())
 
@@ -80,7 +80,7 @@ def train(
         order = rng.permutation(len(train_x))
         for start in range(0, len(order), batch_size):
             indexes = order[start : start + batch_size]
-            inputs = Tensor(train_x[indexes].reshape(-1, 8, 8))
+            inputs = Tensor(train_x[indexes].reshape(-1, 8, 8), copy=False)
             optimizer.zero_grad()
             loss = cross_entropy(model(inputs), train_y[indexes])
             loss.backward()
@@ -88,7 +88,7 @@ def train(
 
         if epoch == 1 or epoch == epochs or epoch % 5 == 0:
             with no_grad():
-                train_inputs = Tensor(train_x.reshape(-1, 8, 8))
+                train_inputs = Tensor(train_x.reshape(-1, 8, 8), copy=False)
                 train_loss = float(
                     cross_entropy(model(train_inputs), train_y).item(
                         compiler=compiler

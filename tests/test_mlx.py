@@ -67,6 +67,22 @@ class MLXBackendTests(unittest.TestCase):
             gpu_gradient, cpu_gradient, rtol=1e-5, atol=1e-6
         )
 
+    def test_native_program_can_defer_synchronization(self) -> None:
+        result = Tensor([1.0, -2.0], dtype=np.float32).relu() + 0.5
+        program = compile_graph(result, compiler="mlx")
+        native_result = program.run_native(evaluate=False)[0]
+        self.mx.eval(native_result)
+        np.testing.assert_allclose(np.array(native_result), [1.5, 0.5])
+
+    def test_copy_false_observes_mutations_across_mlx_calls(self) -> None:
+        source = np.array([1.0, 2.0], dtype=np.float32)
+        tensor = Tensor(source, copy=False)
+        np.testing.assert_allclose(tensor.numpy(compiler="mlx"), [1.0, 2.0])
+
+        source[0] = 9.0
+
+        np.testing.assert_allclose(tensor.numpy(compiler="mlx"), [9.0, 2.0])
+
     def test_batched_matmul_matches_cpu(self) -> None:
         rng = np.random.default_rng(19)
         left = Tensor(rng.normal(size=(2, 4, 3, 5)).astype(np.float32))
@@ -126,6 +142,21 @@ class MLXBackendTests(unittest.TestCase):
         second = Tensor([3.0, 4.0], dtype=np.float32).relu().softmax()
         second.numpy(compiler="mlx")
         self.assertEqual(compiler.cache_size, after_first)
+
+    def test_compiled_cache_preserves_leaf_aliasing(self) -> None:
+        compiler = get_compiler("mlx")
+        left = Tensor([1.0, 2.0], dtype=np.float32)
+        right = Tensor([10.0, 20.0], dtype=np.float32)
+
+        shared = left + left
+        distinct = left + right
+        shared_result = shared.numpy(compiler="mlx")
+        after_shared = compiler.cache_size
+        distinct_result = distinct.numpy(compiler="mlx")
+
+        self.assertEqual(compiler.cache_size, after_shared + 1)
+        np.testing.assert_allclose(shared_result, [2.0, 4.0])
+        np.testing.assert_allclose(distinct_result, [11.0, 22.0])
 
 
 if __name__ == "__main__":
