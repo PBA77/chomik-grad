@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chomik-grad"
+version = "0.1.0"
+description = "A deliberately small lazy tensor and autograd framework"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.23"]
+
+[project.optional-dependencies]
+demo = ["scikit-learn>=1.2"]
+mlx = [
+    "mlx>=0.32.1; python_version >= '3.10' and platform_system == 'Darwin' and platform_machine == 'arm64'",
+]
+
+[tool.setuptools.packages.find]
+include = ["chomikgrad*"]
