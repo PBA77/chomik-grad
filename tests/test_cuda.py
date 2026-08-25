@@ -94,6 +94,28 @@ class CUDABackendTests(unittest.TestCase):
             atol=1e-6,
         )
 
+        singleton_batch = Tensor(
+            rng.normal(size=(1, 3, 5)).astype(np.float32),
+            requires_grad=True,
+        )
+        shared_weight = Tensor(
+            rng.normal(size=(5, 7)).astype(np.float32),
+            requires_grad=True,
+        )
+        (singleton_batch @ shared_weight).sum().backward()
+        gradient_program = compile_graph(shared_weight.grad, compiler="cuda")
+        self.assertNotIn("cp.sum", gradient_program.source)
+        self.assertIn("cp.matmul(cp.reshape", gradient_program.source)
+        expected_gradient = singleton_batch._node.numpy_value()[0].T @ np.ones(
+            (3, 7), dtype=np.float32
+        )
+        np.testing.assert_allclose(
+            gradient_program()[0],
+            expected_gradient,
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
     def test_dynamic_input_and_deferred_synchronization(self) -> None:
         source = Tensor([1.0, 2.0], dtype=np.float32)
         program = compile_graph(
@@ -111,16 +133,8 @@ class CUDABackendTests(unittest.TestCase):
         source = Tensor(rng.normal(size=(3, 4, 64)).astype(np.float32))
         weight = Tensor(rng.normal(size=64).astype(np.float32))
         bias = Tensor(rng.normal(size=64).astype(np.float32))
-        mean = source.mean(axis=-1, keepdims=True)
-        centered = source - mean
-        variance = (centered * centered).mean(axis=-1, keepdims=True)
-        result = centered / (variance + 1e-5).sqrt() * weight + bias
+        result = source.layer_norm(weight, bias)
         expected = result.numpy(compiler="cpu")
-        result._node.lowering = (
-            "layer_norm",
-            (source._node, weight._node, bias._node),
-            1e-5,
-        )
 
         program = compile_graph(result, compiler="cuda")
         self.assertIn("layer_norm", program.source)

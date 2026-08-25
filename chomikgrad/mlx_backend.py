@@ -296,7 +296,7 @@ class MLXCompiler(Compiler):
         namespace: Dict[str, object] = {}
         exec(
             compile(source, "<chomikgrad-mlx>", "exec"),
-            {"mx": self._mx},
+            {"mx": self._mx, "layer_norm": self._layer_norm},
             namespace,
         )
         raw_run = namespace["run"]
@@ -362,6 +362,11 @@ class MLXCompiler(Compiler):
         if node.lowering is not None:
             kind, inputs, argument = node.lowering
             lowered = [names[parent] for parent in inputs]
+            if kind == "layer_norm":
+                return (
+                    f"layer_norm({lowered[0]}, {lowered[1]}, {lowered[2]}, "
+                    f"{float(argument)!r})"
+                )
             if kind == "rms_norm":
                 return (
                     f"mx.fast.rms_norm({lowered[0]}, {lowered[1]}, "
@@ -410,3 +415,15 @@ class MLXCompiler(Compiler):
             return f"mx.take({args[0]}, {args[1]}, axis=0)"
 
         raise ValueError(f"unsupported operation: {node.op}")
+
+    def _layer_norm(
+        self,
+        inputs: Any,
+        weight: Any,
+        bias: Any,
+        epsilon: float,
+    ) -> Any:
+        mean = self._mx.mean(inputs, axis=-1, keepdims=True)
+        centered = inputs - mean
+        variance = self._mx.mean(centered * centered, axis=-1, keepdims=True)
+        return centered / self._mx.sqrt(variance + epsilon) * weight + bias

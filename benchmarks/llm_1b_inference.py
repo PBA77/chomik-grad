@@ -83,13 +83,12 @@ def expected_parameter_count(layers: int, width: int, hidden: int) -> int:
 class ChomikAdapter:
     name = "chomik"
 
-    def __init__(self, *, cuda_lowerings: bool = False) -> None:
+    def __init__(self) -> None:
         from chomikgrad import Tensor, no_grad
 
         self.Tensor = Tensor
         self.inference_context = no_grad
         self.parameter_count = 0
-        self.cuda_lowerings = cuda_lowerings
 
     def parameter(self, value: np.ndarray) -> Any:
         self.parameter_count += value.size
@@ -111,19 +110,12 @@ class ChomikAdapter:
 
     def layer_norm(
         self,
-        output: Any,
         inputs: Any,
         weight: Any,
         bias: Any,
         epsilon: float,
     ) -> Any:
-        if self.cuda_lowerings:
-            output._node.lowering = (
-                "layer_norm",
-                (inputs._node, weight._node, bias._node),
-                epsilon,
-            )
-        return output
+        return inputs.layer_norm(weight, bias, epsilon)
 
 
 class TinygradAdapter:
@@ -156,13 +148,15 @@ class TinygradAdapter:
 
     @staticmethod
     def layer_norm(
-        output: Any,
         inputs: Any,
         weight: Any,
         bias: Any,
         epsilon: float,
     ) -> Any:
-        return output
+        mean = inputs.mean(axis=-1, keepdim=True)
+        centered = inputs - mean
+        variance = (centered * centered).mean(axis=-1, keepdim=True)
+        return centered / (variance + epsilon).sqrt() * weight + bias
 
 
 class TorchAdapter:
@@ -201,13 +195,15 @@ class TorchAdapter:
 
     @staticmethod
     def layer_norm(
-        output: Any,
         inputs: Any,
         weight: Any,
         bias: Any,
         epsilon: float,
     ) -> Any:
-        return output
+        mean = inputs.mean(dim=-1, keepdim=True)
+        centered = inputs - mean
+        variance = (centered * centered).mean(dim=-1, keepdim=True)
+        return centered / (variance + epsilon).sqrt() * weight + bias
 
 
 def random_weight(
@@ -250,12 +246,7 @@ class LayerNorm:
 
     def __call__(self, inputs: Any) -> Any:
         epsilon = 1e-5
-        mean = self.adapter.mean(inputs)
-        centered = inputs - mean
-        variance = self.adapter.mean(centered * centered)
-        output = centered / (variance + epsilon).sqrt() * self.weight + self.bias
         return self.adapter.layer_norm(
-            output,
             inputs,
             self.weight,
             self.bias,
@@ -390,7 +381,7 @@ def run_worker(arguments: argparse.Namespace) -> Dict[str, object]:
     framework = arguments.worker
     compiler = "mlx" if arguments.device == "metal" else "cuda"
     if framework == "chomik":
-        adapter = ChomikAdapter(cuda_lowerings=compiler == "cuda")
+        adapter = ChomikAdapter()
     elif framework == "tinygrad":
         adapter = TinygradAdapter()
     else:

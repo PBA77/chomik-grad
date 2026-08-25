@@ -274,7 +274,7 @@ class Tensor:
         if self.shape == shape:
             return self
         extra = len(self.shape) - len(shape)
-        axes = list(range(extra))
+        axes = [axis for axis in range(extra) if self.shape[axis] != 1]
         axes.extend(
             extra + index
             for index, size in enumerate(shape)
@@ -325,7 +325,75 @@ class Tensor:
     def softmax(self, axis: int = -1) -> "Tensor":
         maximum = self.max(axis=axis, keepdims=True).detach()
         exponentials = (self - maximum).exp()
-        return exponentials / exponentials.sum(axis=axis, keepdims=True)
+        result = exponentials / exponentials.sum(axis=axis, keepdims=True)
+        if not result.requires_grad:
+            return result
+
+        result._parents = (self,)
+
+        def backward(grad: Tensor) -> BackwardResult:
+            weighted = grad * result
+            projection = weighted.sum(axis=axis, keepdims=True)
+            return ((self, result * (grad - projection)),)
+
+        result._backward = backward
+        return result
+
+    def layer_norm(
+        self,
+        weight: "Tensor",
+        bias: "Tensor",
+        epsilon: float = 1e-5,
+    ) -> "Tensor":
+        if self.ndim < 1:
+            raise ValueError("layer_norm requires at least one dimension")
+        expected = (self.shape[-1],)
+        if weight.shape != expected or bias.shape != expected:
+            raise ValueError(
+                f"expected weight and bias shape {expected}, "
+                f"got {weight.shape} and {bias.shape}"
+            )
+        if epsilon <= 0:
+            raise ValueError("epsilon must be positive")
+
+        mean = self.mean(axis=-1, keepdims=True)
+        centered = self - mean
+        variance = (centered * centered).mean(axis=-1, keepdims=True)
+        standard_deviation = (variance + epsilon).sqrt()
+        normalized = centered / standard_deviation
+        result = normalized * weight + bias
+        result._node.lowering = (
+            "layer_norm",
+            (self._node, weight._node, bias._node),
+            float(epsilon),
+        )
+        if not result.requires_grad:
+            return result
+
+        result._parents = (self, weight, bias)
+
+        def backward(grad: Tensor) -> BackwardResult:
+            contributions = []
+            if self.requires_grad:
+                weighted = grad * weight
+                weighted_mean = weighted.mean(axis=-1, keepdims=True)
+                correlation = (weighted * normalized).mean(
+                    axis=-1, keepdims=True
+                )
+                input_grad = (
+                    weighted - weighted_mean - normalized * correlation
+                ) / standard_deviation
+                contributions.append((self, input_grad))
+            if weight.requires_grad:
+                contributions.append(
+                    (weight, (grad * normalized)._unbroadcast(weight.shape))
+                )
+            if bias.requires_grad:
+                contributions.append((bias, grad._unbroadcast(bias.shape)))
+            return contributions
+
+        result._backward = backward
+        return result
 
     def log_softmax(self, axis: int = -1) -> "Tensor":
         maximum = self.max(axis=axis, keepdims=True).detach()

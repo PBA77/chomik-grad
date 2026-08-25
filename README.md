@@ -267,20 +267,20 @@ Na NVIDIA GeForce RTX 5070 Ti (`CuPy 14.2.0`, `tinygrad 0.14.0`,
 
 | przypadek | Chomik CUDA | tinygrad CUDA | PyTorch eager | PyTorch compile/CUDA Graphs |
 |---|---:|---:|---:|---:|
-| elementwise, 1M | 1,523 ms | 2,911 ms | 1,113 ms | **1,002 ms** |
-| reduce sum, 4M | 1,261 ms | 1,926 ms | **0,927 ms** | 1,000 ms |
-| softmax, 1024×1024 | 1,257 ms | 2,663 ms | 0,791 ms | **0,756 ms** |
-| matmul, 64×64 | 0,125 ms | 2,259 ms | **0,112 ms** | 0,177 ms |
-| matmul, 256×256 | 0,227 ms | 2,384 ms | **0,187 ms** | 0,318 ms |
-| matmul, 1024×1024 | 1,497 ms | 3,985 ms | **0,995 ms** | 1,096 ms |
-| matmul, 2048×2048 | 6,202 ms | 9,956 ms | **4,045 ms** | 4,269 ms |
-| batched matmul, 16×4×64 | 0,614 ms | 3,046 ms | **0,362 ms** | 0,445 ms |
-| trening MLP, 20 epok | 0,498 s | 1,239 s | **0,262 s** | 0,363 s |
-| trening transformera, 10 epok | 2,321 s | 1,727 s | **0,987 s** | 1,207 s |
+| elementwise, 1M | 1,621 ms | 2,930 ms | **0,984 ms** | 1,011 ms |
+| reduce sum, 4M | 1,314 ms | 1,963 ms | **0,934 ms** | 0,995 ms |
+| softmax, 1024×1024 | 1,321 ms | 2,685 ms | **0,680 ms** | 0,765 ms |
+| matmul, 64×64 | 0,217 ms | 2,353 ms | **0,107 ms** | 0,180 ms |
+| matmul, 256×256 | 0,283 ms | 2,448 ms | **0,180 ms** | 0,247 ms |
+| matmul, 1024×1024 | 1,507 ms | 3,922 ms | **0,976 ms** | 1,080 ms |
+| matmul, 2048×2048 | 6,354 ms | 10,056 ms | **4,091 ms** | 4,211 ms |
+| batched matmul, 16×4×64 | 0,612 ms | 2,989 ms | **0,366 ms** | 0,442 ms |
+| trening MLP, 20 epok | 0,593 s | 1,241 s | **0,251 s** | 0,282 s |
+| trening transformera, 10 epok | 2,257 s | 1,737 s | **1,000 s** | 1,212 s |
 
-PyTorch eager wygrał osiem przypadków, a CUDA Graphs dwa. Kontrole fingerprintów
-i accuracy przeszły dla wszystkich frameworków. Mikrobenchmarki obejmują
-transfer wejścia z NumPy na GPU oraz odczyt wyniku z powrotem do NumPy.
+PyTorch eager wygrał wszystkie dziesięć przypadków. Kontrole fingerprintów i
+accuracy przeszły dla wszystkich frameworków. Mikrobenchmarki obejmują transfer
+wejścia z NumPy na GPU oraz odczyt wyniku z powrotem do NumPy.
 
 ### Inference rdzenia LLM około 1B
 
@@ -317,6 +317,35 @@ CUDA Graphs i 6,36× od tinygrad. Backend kompiluje graf raz, spłaszcza projekc
 liniowe do 2D GEMM i używa jednego kernela FP32 dla LayerNorm. Model ma
 1 007 169 536 losowych parametrów FP32 (3,752 GiB samych wag); benchmark nie
 zawiera embeddingu, tokenizera, LM headu, KV cache ani generowania tokenów.
+
+### Trening rdzenia LLM około 1B
+
+Benchmark treningowy wykonuje na tym samym rdzeniu syntetyczny MSE oraz SGD
+z `lr=1e-3`. Mierzy pierwszy krok i medianę kolejnych kroków, a zgodność Chomika
+z PyTorch kontroluje przez fingerprint gradientu i zaktualizowanej wagi końcowej
+normalizacji:
+
+```bash
+python benchmarks/llm_1b_training.py --steps 12
+python benchmarks/llm_1b_training.py --steps 12 --json
+```
+
+Na RTX 5070 Ti, FP32, `batch=1` i sekwencji 32 oba frameworki ukończyły 12
+kroków bez OOM:
+
+| metryka | Chomik CUDA | PyTorch eager |
+|---|---:|---:|
+| inicjalizacja modelu | 6,602 s | **6,513 s** |
+| materializacja wag Chomika na GPU | 0,387 s | — |
+| pierwszy `forward + backward + SGD` | 335,8 ms | **283,4 ms** |
+| mediana 11 rozgrzanych kroków | 91,1 ms | **53,9 ms** |
+| peak RAM procesu | 4591,3 MiB | **1186,4 MiB** |
+| pamięć GPU raportowana przez runtime | 11911,4 MiB | **7750,4 MiB** |
+
+Optymalizacja usuwa redukcje po osiach długości jeden, kieruje singleton-batch
+do 2D GEMM, upraszcza grafy gradientów softmax i LayerNorm oraz scala aktualizację
+SGD w jeden kernel. Pierwszy krok Chomika skrócił się z 479 ms do 336 ms; warm
+pozostaje 1,69× wolniejszy od PyTorch i zużywa 1,54× więcej pamięci GPU.
 
 ## Pełne generowanie realnym modelem 1.1B
 

@@ -154,6 +154,7 @@ extern "C" __global__ void layer_norm(
         self.device = CUDADeviceAdapter(cp)
         self._program_cache: Dict[object, Tuple[str, Callable[..., Any]]] = {}
         self._layer_norm_kernel: Optional[Any] = None
+        self._sgd_update_kernel: Optional[Any] = None
 
     @property
     def cache_size(self) -> int:
@@ -317,7 +318,7 @@ extern "C" __global__ void layer_norm(
         native_gradients = self.compile(gradients).run(synchronize=False)
         native_parameters = [self._load_input(node) for node in parameters]
         updated = tuple(
-            parameter - learning_rate * gradient
+            self._update_parameter(parameter, gradient, learning_rate)
             for parameter, gradient in zip(native_parameters, native_gradients)
         )
         parameter_nodes = tuple(
@@ -329,6 +330,26 @@ extern "C" __global__ void layer_norm(
             for node, value in zip(parameters, native_gradients)
         )
         return parameter_nodes, gradient_nodes
+
+    def _update_parameter(
+        self,
+        parameter: Any,
+        gradient: Any,
+        learning_rate: float,
+    ) -> Any:
+        cp = self._cp
+        if self._sgd_update_kernel is None:
+            self._sgd_update_kernel = cp.ElementwiseKernel(
+                "T parameter, T gradient, T learning_rate",
+                "T updated",
+                "updated = parameter - learning_rate * gradient",
+                "chomik_sgd_update",
+            )
+        return self._sgd_update_kernel(
+            parameter,
+            gradient,
+            parameter.dtype.type(learning_rate),
+        )
 
     def _expression(self, node: LazyNode, args: Sequence[str]) -> str:
         if node.lowering is not None and node.lowering[0] in self._SUPPORTED_LOWERINGS:
@@ -364,6 +385,18 @@ extern "C" __global__ void layer_norm(
                 flattened = (-1, left.shape[-1])
                 return (
                     f"cp.matmul(cp.reshape({args[0]}, {flattened!r}), {args[1]})"
+                    f".reshape({node.shape!r})"
+                )
+            if (
+                len(left.shape) > 2
+                and len(right.shape) > 2
+                and int(np.prod(node.shape[:-2])) == 1
+            ):
+                left_matrix = (left.shape[-2], left.shape[-1])
+                right_matrix = (right.shape[-2], right.shape[-1])
+                return (
+                    f"cp.matmul(cp.reshape({args[0]}, {left_matrix!r}), "
+                    f"cp.reshape({args[1]}, {right_matrix!r}))"
                     f".reshape({node.shape!r})"
                 )
             return f"cp.matmul({args[0]}, {args[1]})"

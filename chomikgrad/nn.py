@@ -100,11 +100,7 @@ class LayerNorm(Module):
             raise ValueError(
                 f"expected final dimension {self.features}, got {inputs.shape[-1]}"
             )
-        mean = inputs.mean(axis=-1, keepdims=True)
-        centered = inputs - mean
-        variance = (centered * centered).mean(axis=-1, keepdims=True)
-        normalized = centered / (variance + self.eps).sqrt()
-        return normalized * self.weight + self.bias
+        return inputs.layer_norm(self.weight, self.bias, self.eps)
 
 
 class MultiHeadSelfAttention(Module):

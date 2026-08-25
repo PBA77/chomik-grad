@@ -104,6 +104,45 @@ class AutogradTests(unittest.TestCase):
             values.log_softmax(axis=1).exp().numpy(), expected, rtol=1e-6
         )
 
+    def test_layer_norm_closed_form_gradient_matches_numpy(self) -> None:
+        rng = np.random.default_rng(31)
+        raw = rng.normal(size=(3, 5)).astype(np.float32)
+        raw_weight = rng.normal(size=5).astype(np.float32)
+        raw_bias = rng.normal(size=5).astype(np.float32)
+        upstream = rng.normal(size=(3, 5)).astype(np.float32)
+        values = Tensor(raw, requires_grad=True)
+        weight = Tensor(raw_weight, requires_grad=True)
+        bias = Tensor(raw_bias, requires_grad=True)
+
+        output = values.layer_norm(weight, bias)
+        (output * Tensor(upstream)).sum().backward()
+
+        centered = raw - raw.mean(axis=-1, keepdims=True)
+        standard_deviation = np.sqrt(
+            np.mean(centered * centered, axis=-1, keepdims=True) + 1e-5
+        )
+        normalized = centered / standard_deviation
+        weighted = upstream * raw_weight
+        expected_input_grad = (
+            weighted
+            - weighted.mean(axis=-1, keepdims=True)
+            - normalized
+            * (weighted * normalized).mean(axis=-1, keepdims=True)
+        ) / standard_deviation
+
+        np.testing.assert_allclose(
+            output.numpy(), normalized * raw_weight + raw_bias, rtol=1e-5
+        )
+        np.testing.assert_allclose(
+            values.grad.numpy(), expected_input_grad, rtol=1e-5, atol=1e-6
+        )
+        np.testing.assert_allclose(
+            weight.grad.numpy(), (upstream * normalized).sum(axis=0), rtol=1e-5
+        )
+        np.testing.assert_allclose(
+            bias.grad.numpy(), upstream.sum(axis=0), rtol=1e-5
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
