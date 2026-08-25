@@ -190,7 +190,50 @@ The capital of France is Paris.
 
 Na Apple M1 Max mediana pięciu osobnych uruchomień wyniosła 0,19 s do pierwszego
 tokenu i 46,2 tokenu/s dla rozgrzanych kroków decode; szczyt użycia GPU wyniósł
-około 2,16 GiB. Osiem identyfikatorów wygenerowanych tokenów jest identycznych
+około 2,11 GiB. Osiem identyfikatorów wygenerowanych tokenów jest identycznych
 z niezależnym wynikiem MLX-LM 0.31.3. MLX-LM jest wyspecjalizowanym runtime'em i
 osiągał w tym samym teście około 144 tokenów/s po rozgrzaniu; Chomik pozostaje
 celowo małym, czytelnym frameworkiem ogólnego przeznaczenia.
+
+### Eksperyment TinyLlama względem tinygrad
+
+Porównanie wykonano na Apple M1 Max, macOS 27.0 i Pythonie 3.11.14. Chomik
+używał commita `6c69931` oraz MLX 0.32.1. tinygrad pochodził z oficjalnego taga
+[`v0.14.0`](https://github.com/tinygrad/tinygrad/tree/v0.14.0), commit
+`6f87158`; użyto jego implementacji `tinygrad.llm.model.Transformer`, `TinyJit`
+i cache K/V. Tag źródłowy był konieczny, ponieważ koło 0.14.0 z PyPI nie
+zawierało w testowanym środowisku katalogu `tinygrad.llm.kernels`.
+
+Oba frameworki dostały te same wagi BF16 przypiętej rewizji TinyLlama, ten sam
+28-tokenowy chat prompt, `batch=1`, greedy decoding i limit ośmiu nowych tokenów.
+Wagi były już w lokalnym cache, a czas ich pobierania nie wchodził do pomiaru.
+Wyniki zimnego Chomika są medianą pięciu osobnych procesów. Następnie dla obu
+frameworków wykonano po pięć generacji w tym samym procesie, już po capture.
+Dla tinygrad dodatkowo zapisano dwa zimne uruchomienia.
+
+| TinyLlama 1.1B, Metal | Chomik | tinygrad 0.14.0 |
+|---|---:|---:|
+| pierwszy token, zimny JIT | **0,19 s** | 3,41–3,83 s |
+| pełne osiem tokenów, zimny JIT | **0,37 s** | 5,18–5,78 s |
+| pierwszy token po capture | **0,10 s** | 0,49 s |
+| pełne osiem tokenów po capture | **0,26 s** | 0,67 s |
+| rozgrzany decode | **45,8 tokenu/s** | 39,2 tokenu/s |
+| pamięć urządzenia | 2,11 GiB | **2,05 GiB** |
+
+W stałym decode Chomik był około 17% szybszy, a cała krótka odpowiedź po
+rozgrzaniu zajmowała około 2,5 raza mniej czasu. Największa różnica wystąpiła
+przy zimnym JIT: tinygrad potrzebował dwóch dodatkowych wolnych kroków na
+capture i kompilację. tinygrad zużył około 3% mniej pamięci urządzenia.
+
+W obu przypadkach powstały identyczne identyfikatory tokenów:
+
+```text
+1576, 7483, 310, 3444, 338, 3681, 29889, 2
+The capital of France is Paris.
+```
+
+Nie jest to porównanie identycznej precyzji aktywacji. Oficjalna ścieżka LLM
+tinygrad konwertuje wynik embeddingu do FP32 i przechowuje cache K/V w FP16;
+Chomik zachowuje BF16 dla aktywacji i cache. Wagi, model, prompt, wynik oraz
+urządzenie były jednak takie same. Dla dłuższych kontekstów i odpowiedzi
+proporcje mogą się zmienić.
