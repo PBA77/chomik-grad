@@ -1,32 +1,33 @@
 # chomik-grad
 
-Minimalny framework tensorowy w Pythonie: lazy graf, autograd, wtyczkowe
-kompilatory i mały zestaw narzędzi do uczenia sieci. Runtime wymaga tylko NumPy.
+Minimal tensor framework in Python: lazy graphs, autograd, pluggable compilers,
+and a small set of neural-network training tools. The runtime requires only
+NumPy.
 
-## Architektura
+## Architecture
 
-Cały IR ma sześć operacji:
+The entire IR has six operations:
 
-1. `ELEMENTWISE` — m.in. add, mul, exp, log, sqrt i ReLU jako warianty jednej operacji,
+1. `ELEMENTWISE` — add, multiply, exp, log, sqrt, and ReLU as variants of one operation,
 2. `REDUCE` — sum/max,
 3. `RESHAPE`,
 4. `PERMUTE`,
 5. `MATMUL`,
-6. `GATHER` — indeksowanie pierwszej osi, używane m.in. przez embeddingi.
+6. `GATHER` — indexing along the first axis, used by embeddings among other things.
 
-`softmax` i `log_softmax` są stabilnymi numerycznie kompozycjami tych
-prymitywów. Nie dodają kolejnej instrukcji ani specjalnego przypadku w backendach.
+`softmax` and `log_softmax` are numerically stable compositions of these
+primitives. They do not add another instruction or a special case to backends.
 
-Operacje na `Tensor` wyłącznie budują graf. `numpy()`, `item()`, `realize()` albo
-`SGD.step()` przekazują cały potrzebny graf do wybranego kompilatora. Domyślna
-wtyczka `cpu` generuje prostoliniową funkcję Pythona z wywołaniami NumPy, a
-następnie ją wykonuje.
+Operations on `Tensor` only build a graph. `numpy()`, `item()`, `realize()`, or
+`SGD.step()` pass the complete required graph to the selected compiler. The
+default `cpu` plugin generates a straight-line Python function containing NumPy
+calls and then executes it.
 
-CUDA i OpenCL najpierw budują lokalny dla backendu `GraphPlan`. Plan wybiera
-obsługiwane loweringi i fuzje bez zapisywania ich w `LazyNode`, dlatego
-kompilacja jednego backendu nie zmienia grafu używanego później przez inny.
-Oba backendy korzystają ze wspólnej analizy grafu i generatora prostoliniowego
-programu Pythona; różnią się wyłącznie mapowaniem operacji na natywne kernele.
+CUDA and OpenCL first build a backend-local `GraphPlan`. The plan selects
+supported lowerings and fusions without writing them to `LazyNode`, so compiling
+with one backend cannot change the graph later used by another. Both backends
+share graph analysis and a straight-line Python program generator; only their
+mappings from operations to native kernels differ.
 
 ```python
 import numpy as np
@@ -37,32 +38,32 @@ optimizer = SGD(model.parameters(), lr=0.1)
 x = Tensor(np.random.randn(8, 4).astype(np.float32))
 y = np.array([0, 1, 2, 0, 1, 2, 0, 1])
 
-loss = cross_entropy(model(x), y)  # nadal nic nie zostało policzone
-loss.backward()                    # powstaje lazy graf gradientów
-optimizer.step()                   # kompilacja i wykonanie na CPU
+loss = cross_entropy(model(x), y)  # nothing has been computed yet
+loss.backward()                    # builds the lazy gradient graph
+optimizer.step()                   # compiles and executes it on the CPU
 ```
 
-CUDA i OpenCL SGD mogą opcjonalnie aktualizować istniejący storage parametrów:
+CUDA and OpenCL SGD can optionally update existing parameter storage:
 
 ```python
 optimizer = SGD(model.parameters(), lr=0.1, inplace=True)
 optimizer.step(compiler="cuda")
 ```
 
-Domyślne `inplace=False` zachowuje snapshot wag używany przez wcześniej
-zbudowane lazy grafy. Tryb in-place zmniejsza peak pamięci, ale takie stare
-grafy widzą już zaktualizowane wagi.
+The default `inplace=False` preserves the weight snapshot used by previously
+built lazy graphs. In-place mode reduces peak memory, but those old graphs then
+observe the updated weights.
 
-Domyślnie `Tensor(np_array)` posiada własną kopię danych. Dla świeżych lub
-niemutowanych tablic można jawnie użyć `Tensor(np_array, copy=False)`, aby
-pominąć dodatkową kopię w RAM. Backend MLX nie cache'uje wtedy wejścia i
-zauważa późniejsze zmiany źródłowej tablicy.
+By default, `Tensor(np_array)` owns a copy of its data. For fresh or immutable
+arrays, `Tensor(np_array, copy=False)` can be used explicitly to avoid an
+additional RAM copy. The MLX backend does not cache such an input and therefore
+observes later changes to the source array.
 
-## Wtyczka kompilatora i urządzenia
+## Compiler and device plugins
 
-Kompilator dostaje wyjściowe `LazyNode` i zwraca `CompiledProgram`. Każdy
-program udostępnia ten sam kontrakt `run(bindings, synchronize=False)`, więc
-można podmieniać wartości liści bez budowania grafu od nowa:
+A compiler receives output `LazyNode` objects and returns a `CompiledProgram`.
+Every program exposes the same `run(bindings, synchronize=False)` contract, so
+leaf values can be replaced without rebuilding the graph:
 
 ```python
 native_outputs = program.run(
@@ -71,8 +72,8 @@ native_outputs = program.run(
 )
 ```
 
-Dla inferencji można dodatkowo wskazać liście, które rzeczywiście zmieniają
-się między wywołaniami. Backend może wtedy przechwycić wagi i pozostałe stałe:
+For inference, callers can additionally identify which leaves actually change
+between invocations. The backend can then capture weights and other constants:
 
 ```python
 program = compile_graph(
@@ -82,57 +83,57 @@ program = compile_graph(
 )
 ```
 
-MLX używa tej informacji wyłącznie do specjalizacji programu inferencyjnego.
-Zwykłe `compile_graph(...)`, autograd i trening nadal przekazują wszystkie
-liście dynamicznie, więc aktualizacja parametrów nie wymaga rekompilacji.
+MLX uses this information only to specialize inference programs. Regular
+`compile_graph(...)`, autograd, and training still pass every leaf dynamically,
+so parameter updates do not require recompilation.
 
-Wtyczka ma parę małych elementów:
+A plugin consists of a few small components:
 
 ```python
 from chomikgrad import Compiler, DeviceAdapter, register_compiler
 
 class MyDevice(DeviceAdapter):
-    # array, evaluate, synchronize, to_numpy, argmax i dtype
+    # array, evaluate, synchronize, to_numpy, argmax, and dtype
     ...
 
 class MyCompiler(Compiler):
     device = MyDevice()
 
     def compile(self, outputs):
-        # Przejdź inputs każdego LazyNode i obsłuż sześć wartości Op.
-        # Zwróć CompiledProgram korzystający z tego samego device.
+        # Traverse each LazyNode's inputs and handle all six Op values.
+        # Return a CompiledProgram using the same device.
         ...
 
 register_compiler("my-device", MyCompiler)
 ```
 
-`DeviceAdapter` oddziela tworzenie natywnych tablic, synchronizację, odczyt do
-NumPy, `argmax`, mapowanie dtype i opcjonalne ładowanie safetensors od kompilacji
-IR. Dzięki temu kolejny backend, np. Vulkan, może użyć tego samego runtime'u
-inferencji; nadal musi dostarczyć własne sześć loweringów i ewentualne szybkie
-kernele RMSNorm/RoPE/attention. Kompilator można wskazać dla pojedynczej
-realizacji:
+`DeviceAdapter` separates native array creation, synchronization, NumPy
+readback, `argmax`, dtype mapping, and optional safetensors loading from IR
+compilation. Additional backends can therefore reuse the same inference
+runtime, although each must still provide its own six lowerings and any fast
+RMSNorm, RoPE, or attention kernels. A compiler can be selected for a single
+realization:
 `tensor.numpy(compiler="my-device")`.
 
-## GPU Apple Silicon przez MLX
+## Apple Silicon GPU through MLX
 
-Opcjonalna wtyczka `mlx` tłumaczy dokładnie ten sam sześciooperacyjny IR na
-`mlx.core` i jawnie wykonuje graf na urządzeniu Metal GPU. Brak MLX albo Metal
-kończy się czytelnym błędem — backend nie przechodzi po cichu na CPU.
+The optional `mlx` plugin translates the same six-operation IR to `mlx.core`
+and explicitly executes the graph on a Metal GPU device. Missing MLX or Metal
+support produces a clear error; the backend never silently falls back to CPU.
 
-Parametry i gradienty pozostają jako natywne tablice MLX na GPU pomiędzy
-krokami. Strukturalnie identyczne grafy korzystają z cache oraz `mx.compile`, a
-SGD oblicza gradienty i aktualizuje parametry przy jednej synchronizacji GPU,
-bez kopiowania ich przez NumPy. Transfer do RAM-u
-następuje dopiero po jawnym `numpy()`, `item()` albo użyciu kompilatora `cpu`.
-MLX implementuje wspólne `CompiledProgram.run(...)` i `DeviceAdapter`, zamiast
-wymagać specjalnego API od generatora. Pozwala to utrzymywać jeden program
-autoregresywnego decode i wiązać do niego nowe tokeny oraz cache K/V. Po
-wybraniu szybkiego loweringu kompilator odcina jego nieużywane przenośne
-rozwinięcie; pełny fallback pozostaje dostępny dla CPU i innych backendów.
+Parameters and gradients remain native MLX arrays on the GPU between steps.
+Structurally identical graphs reuse the cache and `mx.compile`, while SGD
+computes gradients and updates parameters with a single GPU synchronization and
+without copying them through NumPy. Data is transferred to RAM only after an
+explicit `numpy()`, `item()`, or use of the `cpu` compiler. MLX implements the
+common `CompiledProgram.run(...)` and `DeviceAdapter` interfaces instead of
+requiring a generator-specific API. This allows one autoregressive decode
+program to be retained while binding new tokens and KV caches to it. Once a
+fast lowering has been selected, the compiler prunes its unused portable
+expansion; the complete fallback remains available to CPU and other backends.
 
-MLX wymaga Apple Silicon, macOS 14+ i natywnego Pythona 3.10+. Przykładowa
-instalacja, gdy systemowy Python jest starszy:
+MLX requires Apple Silicon, macOS 14+, and a native Python 3.10+. Example setup
+when the system Python is older:
 
 ```bash
 /opt/homebrew/bin/python3 -m venv .venv
@@ -140,12 +141,12 @@ instalacja, gdy systemowy Python jest starszy:
 .venv/bin/python examples/train_digits.py --compiler mlx
 ```
 
-## NVIDIA GPU przez CUDA
+## NVIDIA GPUs through CUDA
 
-Opcjonalna wtyczka `cuda` wykonuje ten sam sześciooperacyjny IR przez CuPy.
-Nie przechodzi po cichu na CPU, a parametry i gradienty SGD pozostają w pamięci
-GPU pomiędzy krokami. Wariant zależności `ctk` dołącza potrzebne składniki
-CUDA, dlatego wystarczy zgodny sterownik NVIDIA:
+The optional `cuda` plugin executes the same six-operation IR through CuPy. It
+never silently falls back to CPU, and SGD parameters and gradients stay in GPU
+memory between steps. The `ctk` dependency variant bundles the required CUDA
+components, so a compatible NVIDIA driver is sufficient:
 
 ```bash
 python -m pip install '.[benchmark,cuda]'
@@ -154,39 +155,41 @@ python benchmarks/compare_tinygrad_10_cases.py --device cuda --trials 3
 python benchmarks/compare_tinygrad_10_cases.py --device cuda --trials 5 --chomik-jit
 ```
 
-Opcjonalny `compile_train_step` przechwytuje stałokształtny forward i backward
-tylko raz. CUDA scala łańcuchy elementwise, softmax/log-softmax oraz aktualizacje
-SGD w grupy do 16 parametrów. Jest to replay wygenerowanego programu Chomika,
-nie CUDA Graph: CuPy 14.2 nie pozwala obecnie przechwycić używanego tutaj
-`cp.matmul`, ponieważ ustawianie streamu cuBLAS podczas capture jest niewspierane.
+The optional `compile_train_step` captures a fixed-shape forward and backward
+graph only once. CUDA fuses elementwise chains, softmax/log-softmax, and SGD
+updates in groups of up to 16 parameters. This replays a generated Chomik
+program rather than a CUDA Graph: CuPy 14.2 cannot currently capture the
+`cp.matmul` calls used here because setting the cuBLAS stream during capture is
+unsupported.
 
-Na natywnym Windows wariant `torch-compile` używa oficjalnego backendu
-`cudagraphs`, ponieważ wheel PyTorch nie zawiera Tritona. Na systemie z
-działającym Tritonem można wybrać pełny Inductor przez
+On native Windows, the `torch-compile` variant uses the official `cudagraphs`
+backend because the PyTorch wheel does not include Triton. On systems with a
+working Triton installation, full Inductor can be selected with
 `--torch-compile-backend inductor`.
 
-## GPU przez OpenCL
+## GPUs through OpenCL
 
-Opcjonalna wtyczka `opencl` wykonuje pełny IR FP32 przez PyOpenCL. Operacje
-elementwise, redukcje, reshape, permute, gather i SGD korzystają z własnych
-kerneli, a zwykły, strided-batched i offset-batched `MATMUL` z CLBlast. Forward
-LayerNorm, softmax i log-softmax oraz ich backwardy mają scalone kernele. Łańcuchy
-operacji elementwise o tym samym kształcie i jednym konsumencie są scalane bez
-duplikowania obliczeń. `reshape` i `permute` używają lekkich widoków runtime,
-a aktualizacje SGD są łączone w grupy do 16 parametrów na kernel. Parametry oraz
-gradienty pozostają na GPU między krokami i nie ma cichego fallbacku na CPU.
+The optional `opencl` plugin executes the complete FP32 IR through PyOpenCL.
+Elementwise operations, reductions, reshape, permute, gather, and SGD use
+custom kernels, while regular, strided-batched, and offset-batched `MATMUL` use
+CLBlast. LayerNorm, softmax, and log-softmax have fused forward and backward
+kernels. Single-consumer elementwise chains of the same shape are fused without
+duplicating computation. `reshape` and `permute` use lightweight runtime views,
+and SGD updates are grouped in batches of up to 16 parameters per kernel.
+Parameters and gradients remain on the GPU between steps, with no silent CPU
+fallback.
 
-PyOpenCL instaluje się z extra projektu, natomiast współdzieloną bibliotekę
-CLBlast 1.7 trzeba zainstalować osobno. Jej ścieżkę można podać bezpośrednio:
+PyOpenCL is installed through the project extra, while the shared CLBlast 1.7
+library must be installed separately. Its path can be provided explicitly:
 
 ```powershell
 python -m pip install '.[benchmark,opencl]'
-$env:CLBLAST_PATH='C:\ścieżka\do\clblast.dll'
+$env:CLBLAST_PATH='C:\path\to\clblast.dll'
 python benchmarks\compare_tinygrad_10_cases.py --device opencl --trials 3
 ```
 
-Dla powtarzanego kroku treningowego o stałym kształcie batcha można opcjonalnie
-przechwycić forward, backward i SGD tylko raz:
+A repeated training step with a fixed batch shape can capture forward,
+backward, and SGD once:
 
 ```python
 from chomikgrad import SGD, Tensor, compile_train_step
@@ -207,71 +210,71 @@ step = compile_train_step(
 step(batch_inputs, batch_targets_one_hot)
 ```
 
-Wejścia mogą zmieniać wartości, lecz muszą zachować kształt i dtype przykładów.
-Dla krótszego ostatniego batcha trzeba utworzyć drugi krok. Domyślnie krok nie
-realizuje wartości loss; `return_loss=True` włącza jej zwracanie do monitoringu.
+Inputs may change values but must keep the examples' shapes and dtypes. A
+shorter final batch requires a second compiled step. By default the step does
+not materialize its loss; `return_loss=True` enables loss reporting.
 
-Na Linuksie `CLBLAST_PATH` może wskazywać `libclblast.so`. Backend sprawdza też
-systemowy loader oraz `Library/bin/clblast.dll` albo `lib/libclblast.so`
-aktywnego virtualenv. Benchmark ustawia dla tinygrad urządzenie `CL`, więc obie
-implementacje używają OpenCL na tym samym GPU.
+On Linux, `CLBLAST_PATH` may point to `libclblast.so`. The backend also checks
+the system loader and `Library/bin/clblast.dll` or `lib/libclblast.so` in the
+active virtual environment. The benchmark selects tinygrad's `CL` device, so
+both implementations use OpenCL on the same GPU.
 
-Backend celowo odrzuca dtype inne niż FP32, z wyjątkiem int32/int64 dla indeksów
-`GATHER`. Sterownik NVIDIA użyty w pomiarze udostępniał OpenCL 3.0, ale tylko
-OpenCL C 1.2 i bez `cl_khr_fp16`, dlatego tryb FP16 nie jest oferowany pozornie
-przez konwersję do FP32.
+The backend deliberately rejects dtypes other than FP32, except int32/int64
+`GATHER` indices. The NVIDIA driver used for the measurements exposed OpenCL
+3.0 but only OpenCL C 1.2 and no `cl_khr_fp16`, so the backend does not pretend
+to provide FP16 by converting it to FP32.
 
-Na GeForce RTX 5070 Ti (`PyOpenCL 2026.1.3`, `CLBlast 1.7.0`,
-`tinygrad 0.14.0`, Python 3.14.2) pojedynczy pełny przebieg z domyślną liczbą
-powtórzeń mikrobenchmarków dał:
+On a GeForce RTX 5070 Ti (`PyOpenCL 2026.1.3`, `CLBlast 1.7.0`,
+`tinygrad 0.14.0`, Python 3.14.2), one complete run with the default number of
+microbenchmark repetitions produced:
 
-| przypadek | Chomik OpenCL | tinygrad CL |
+| case | Chomik OpenCL | tinygrad CL |
 |---|---:|---:|
-| elementwise, 1M | **1,964 ms** | 2,886 ms |
-| reduce sum, 4M | **1,327 ms** | 1,799 ms |
-| softmax, 1024×1024 | **1,438 ms** | 2,874 ms |
-| matmul, 64×64 | **0,277 ms** | 2,342 ms |
-| matmul, 256×256 | **0,344 ms** | 2,393 ms |
-| matmul, 1024×1024 | **2,370 ms** | 3,904 ms |
-| matmul, 2048×2048 | **7,864 ms** | 9,556 ms |
-| batched matmul, 16×4×64 | **0,734 ms** | 2,894 ms |
-| trening MLP, 20 epok | 3,092 s | **2,262 s** |
-| trening transformera, 10 epok | 7,776 s | **6,695 s** |
+| elementwise, 1M | **1.964 ms** | 2.886 ms |
+| reduce sum, 4M | **1.327 ms** | 1.799 ms |
+| softmax, 1024x1024 | **1.438 ms** | 2.874 ms |
+| matmul, 64x64 | **0.277 ms** | 2.342 ms |
+| matmul, 256x256 | **0.344 ms** | 2.393 ms |
+| matmul, 1024x1024 | **2.370 ms** | 3.904 ms |
+| matmul, 2048x2048 | **7.864 ms** | 9.556 ms |
+| batched matmul, 16x4x64 | **0.734 ms** | 2.894 ms |
+| MLP training, 20 epochs | 3.092 s | **2.262 s** |
+| transformer training, 10 epochs | 7.776 s | **6.695 s** |
 
-Scalone backwardy, pula buforów, przygotowywanie invokerów tylko raz,
-offset-batched GEMM dla częściowego broadcastu i cache planów offsetów skróciły
-trening transformera z 331,278 s do 7,776 s, czyli 42,6 raza. Chomik wygrał
-wszystkie osiem mikrobenchmarków; tinygrad pozostał o 37% szybszy w treningu MLP
-i o 16% w treningu transformera. Na tym samym GPU backend CUDA nadal pozostaje
-właściwym wyborem dla maksymalnej wydajności.
+Fused backward kernels, buffer pooling, one-time invoker preparation,
+offset-batched GEMM for partial broadcasting, and cached offset plans reduced
+transformer training from 331.278 s to 7.776 s, a 42.6x improvement. Chomik won
+all eight microbenchmarks; tinygrad remained 37% faster for MLP training and 16%
+faster for transformer training. CUDA remains the preferred backend for maximum
+performance on the same GPU.
 
-Osobna seria pięciu pełnych prób treningowych porównała capture po fuzji z
-TinyJit. `--repeat-scale 0.01` skracał wyłącznie mikrobenchmarki i nie zmieniał
-liczby epok:
+A separate series of five complete training trials compared capture after
+fusion with TinyJit. `--repeat-scale 0.01` shortened only the microbenchmarks
+and did not change the epoch counts:
 
-| wariant | MLP pierwszy | MLP mediana | Transformer pierwszy | Transformer mediana |
+| variant | MLP first | MLP median | Transformer first | Transformer median |
 |---|---:|---:|---:|---:|
-| Chomik `compile_train_step` | **1,327 s** | **0,626 s** | **4,250 s** | **2,237 s** |
-| tinygrad `TinyJit` | 3,336 s | 2,217 s | 8,957 s | 2,816 s |
+| Chomik `compile_train_step` | **1.327 s** | **0.626 s** | **4.250 s** | **2.237 s** |
+| tinygrad `TinyJit` | 3.336 s | 2.217 s | 8.957 s | 2.816 s |
 
-W porównaniu z capture sprzed fuzji mediana Chomika spadła z 1,023 s do 0,626 s
-dla MLP i z 3,965 s do 2,237 s dla transformera. Fuzje softmax i elementwise
-usunęły 28 operacji wykonawczych z grafu transformera, lekkie widoki ograniczyły
-narzut Pythona, a zgrupowane SGD zmniejszyło liczbę kerneli aktualizacji 39 wag
-z 39 do 3 na krok. Po rozgrzaniu Chomik jest 3,54 raza szybszy od tinygrad dla
-MLP i 1,26 raza dla transformera; pierwszy przebieg transformera jest o 52,5%
-krótszy.
+Compared with capture before fusion, Chomik's median fell from 1.023 s to
+0.626 s for the MLP and from 3.965 s to 2.237 s for the transformer. Softmax
+and elementwise fusion removed 28 executable operations from the transformer
+graph, lightweight views reduced Python overhead, and grouped SGD reduced the
+39 weight-update kernels to three per step. After warm-up, Chomik is 3.54x
+faster than tinygrad for the MLP and 1.26x faster for the transformer; the
+transformer's first run is 52.5% shorter.
 
-## GPU przez Vulkan
+## GPUs through Vulkan
 
-Opcjonalna wtyczka `vulkan` używa `wgpu-native`, ale wybiera wyłącznie adapter,
-którego `backend_type` jest równy `Vulkan`; nie może więc przejść po cichu na
-D3D12 ani OpenGL. Każdy lazy graf jest kodowany jako jeden command buffer z
-kernelami WGSL. Reshape i permute zachowują widoki przez stride'y, a tiled
-matmul obsługuje batch i broadcasting bez pętli dispatchy po stronie Pythona.
-Backend obejmuje pełny IR FP32, autograd oraz zwykły i in-place SGD.
+The optional `vulkan` plugin uses `wgpu-native` and selects only an adapter
+whose `backend_type` is `Vulkan`; it cannot silently switch to D3D12 or OpenGL.
+Each lazy graph is encoded as one command buffer containing WGSL kernels.
+Reshape and permute preserve views through strides, while tiled matmul supports
+batches and broadcasting without Python-side dispatch loops. The backend covers
+the complete FP32 IR, autograd, and regular or in-place SGD.
 
-`wgpu` wymaga Pythona 3.11 lub nowszego:
+`wgpu` requires Python 3.11 or newer:
 
 ```powershell
 python -m pip install '.[benchmark,vulkan]'
@@ -279,45 +282,45 @@ python -m pip install 'dawn-python==0.3.0'
 python benchmarks\compare_tinygrad_10_cases.py --device vulkan --micro-only
 ```
 
-Porównanie z tinygrad WEBGPU wymaga dodatkowo `dawn-python==0.3.0`. Skrypt
-ustawia `WEBGPU_BACKEND=WGPUBackendType_Vulkan`, więc Dawn także nie wybiera
-innego API. Indeksy int64 są po sprawdzeniu zakresu zawężane do int32, ponieważ
-WGSL nie udostępnia przenośnego typu int64 dla buforów storage.
+Comparison with tinygrad WEBGPU additionally requires `dawn-python==0.3.0`.
+The script sets `WEBGPU_BACKEND=WGPUBackendType_Vulkan`, so Dawn also cannot
+select another API. Int64 indices are range-checked and narrowed to int32
+because WGSL has no portable int64 storage-buffer type.
 
-Na tej samej GeForce RTX 5070 Ti (`wgpu 0.31.1`, `dawn-python 0.3.0`,
-`tinygrad 0.14.0`) pełny zestaw powtórzeń mikrobenchmarku dał:
+On the same GeForce RTX 5070 Ti (`wgpu 0.31.1`, `dawn-python 0.3.0`,
+`tinygrad 0.14.0`), the complete microbenchmark repetition set produced:
 
-| przypadek | Chomik Vulkan | tinygrad WEBGPU/Vulkan |
+| case | Chomik Vulkan | tinygrad WEBGPU/Vulkan |
 |---|---:|---:|
-| elementwise, 1M | **5,111 ms** | 8,427 ms |
-| reduce sum, 4M | **5,535 ms** | 42,152 ms |
-| softmax, 1024×1024 | **3,755 ms** | 52,596 ms |
-| matmul, 64×64 | **0,828 ms** | 3,347 ms |
-| matmul, 256×256 | **0,929 ms** | 3,465 ms |
-| matmul, 1024×1024 | **4,735 ms** | 9,807 ms |
-| matmul, 2048×2048 | **20,517 ms** | 32,764 ms |
-| batched matmul, 16×4×64 | **2,508 ms** | 4,721 ms |
+| elementwise, 1M | **5.111 ms** | 8.427 ms |
+| reduce sum, 4M | **5.535 ms** | 42.152 ms |
+| softmax, 1024x1024 | **3.755 ms** | 52.596 ms |
+| matmul, 64x64 | **0.828 ms** | 3.347 ms |
+| matmul, 256x256 | **0.929 ms** | 3.465 ms |
+| matmul, 1024x1024 | **4.735 ms** | 9.807 ms |
+| matmul, 2048x2048 | **20.517 ms** | 32.764 ms |
+| batched matmul, 16x4x64 | **2.508 ms** | 4.721 ms |
 
-Chomik wygrał wszystkie osiem przypadków. Jego pojedynczy pełny worker wykonał
-20 epok MLP w 1,463 s i 10 epok transformera w 5,911 s. Worker treningowy
-tinygrad/Dawn nie ukończył się w ciągu pięciu minut i został przerwany, dlatego
-nie przypisano mu pozornego wyniku. Dla transformera Chomik Vulkan był 1,32×
-szybszy od OpenCL (7,776 s), ale 2,8× wolniejszy od CUDA (2,095 s).
+Chomik won all eight cases. Its single complete worker ran 20 MLP epochs in
+1.463 s and 10 transformer epochs in 5.911 s. The tinygrad/Dawn training worker
+did not finish within five minutes and was stopped, so no misleading result is
+reported. For transformer training, Chomik Vulkan was 1.32x faster than OpenCL
+(7.776 s) but 2.8x slower than CUDA (2.095 s).
 
-## Neural Engine Apple Silicon przez Core ML
+## Apple Silicon Neural Engine through Core ML
 
-Opcjonalna wtyczka `coreml` kompiluje ten sam sześciooperacyjny IR do
-`ML Program` w FP16 i ładuje go z `CPU_AND_NE`. Apple nie udostępnia
-bezpośredniego API obliczeniowego ANE ani trybu `NE_ONLY`: Core ML podejmuje
-ostateczną decyzję osobno dla każdej operacji. `CoreMLProgram.compute_plan_summary()`
-odczytuje plan skompilowanego modelu, dlatego testy nie traktują samej flagi
-`CPU_AND_NE` jako dowodu użycia Neural Engine.
+The optional `coreml` plugin compiles the same six-operation IR into an FP16
+`ML Program` and loads it with `CPU_AND_NE`. Apple provides neither a direct ANE
+compute API nor an `NE_ONLY` mode: Core ML makes the final decision separately
+for every operation. `CoreMLProgram.compute_plan_summary()` reads the compiled
+model's execution plan, so tests do not treat the `CPU_AND_NE` flag alone as
+proof that the Neural Engine was used.
 
-Backend jest przeznaczony wyłącznie do inferencji. Przechwytuje stałe wagi,
-rozpoznaje `x @ weight.T` jako Core ML `linear` i dzieli modele przekraczające
-1 GiB stałych na segmenty. Bez segmentacji monolityczny TinyLlama 1.1B działał
-poprawnie, ale Core ML na M1 przypisał cały graf do CPU. Trzy segmenty zachowują
-identyczny wynik i przywracają wykonanie większości grafu na ANE.
+The backend is inference-only. It captures constant weights, recognizes
+`x @ weight.T` as Core ML `linear`, and splits models with more than 1 GiB of
+constants into segments. Without segmentation, monolithic TinyLlama 1.1B ran
+correctly, but Core ML assigned the entire graph to the CPU on M1. Three
+segments preserve identical output and move most of the graph back to the ANE.
 
 ```bash
 .venv/bin/python -m pip install '.[coreml,llm]'
@@ -325,43 +328,43 @@ identyczny wynik i przywracają wykonanie większości grafu na ANE.
   --compiler coreml --dtype float16 --max-new-tokens 8
 ```
 
-Ograniczenia są celowo jawne:
+The limitations are deliberately explicit:
 
-- tylko FP16, macOS 15+ i Apple Silicon,
-- inference ze stałymi kształtami; brak autogradu i treningu,
-- wywołanie `MLModel.predict` jest synchroniczne i przechodzi przez tablice
-  NumPy na granicach segmentów,
-- pojedynczy token przy `batch=1` nie wykorzystuje ANE tak efektywnie jak GPU.
+- FP16 only, macOS 15+, and Apple Silicon,
+- fixed-shape inference; no autograd or training,
+- `MLModel.predict` is synchronous and crosses through NumPy arrays at segment
+  boundaries,
+- a single token at `batch=1` does not use the ANE as efficiently as the GPU.
 
-Sportowe porównanie używa dokładnie tych samych wag, aktywacji, cache K/V,
-implementacji Chomika, promptu i tokenów w FP16:
+The like-for-like comparison uses exactly the same weights, activations, KV
+cache, Chomik implementation, prompt, and FP16 tokens:
 
 ```bash
 .venv/bin/python benchmarks/tinyllama_coreml_vs_mlx.py --trials 3
 ```
 
-Przykładowy wynik na Apple M1 Max (`coremltools 9.0`, `MLX 0.32.1`, 28 tokenów
-promptu i osiem tokenów odpowiedzi):
+Example result on an Apple M1 Max (`coremltools 9.0`, `MLX 0.32.1`, a 28-token
+prompt, and eight response tokens):
 
 | TinyLlama 1.1B FP16 | Core ML / ANE | MLX / GPU |
 |---|---:|---:|
-| pierwszy token, wraz z kompilacją | 42,879 s | **0,061 s** |
-| pełna odpowiedź, wraz z kompilacją | 71,836 s | **0,140 s** |
-| pierwszy token po rozgrzaniu | 0,793 s | **0,021 s** |
-| rozgrzany decode | 15,0 tokenu/s | **114,5 tokenu/s** |
-| pełna odpowiedź po rozgrzaniu | 1,424 s | **0,083 s** |
+| first token, including compilation | 42.879 s | **0.061 s** |
+| complete response, including compilation | 71.836 s | **0.140 s** |
+| first token after warm-up | 0.793 s | **0.021 s** |
+| warm decode | 15.0 tokens/s | **114.5 tokens/s** |
+| complete response after warm-up | 1.424 s | **0.083 s** |
 
-Compute Plan wskazał dla prefillu 1377 operacji preferujących Neural Engine i
-185 CPU, a dla decode odpowiednio 1235 i 218. Wszystkie osiem identyfikatorów
-tokenów pozostało identycznych. Na M1 ANE jest więc działającym backendem
-badawczym, ale nie jest konkurencyjny czasowo wobec
-Metal GPU dla autoregresywnego LLM `batch=1`.
+The Compute Plan reported 1,377 prefill operations preferring the Neural Engine
+and 185 preferring the CPU; the decode counts were 1,235 and 218 respectively.
+All eight generated token IDs remained identical. On M1, the ANE is therefore a
+working research backend, but it is not performance-competitive with the Metal
+GPU for an autoregressive LLM at `batch=1`.
 
-Dokumentacja Apple: [wybór CPU i Neural Engine](https://developer.apple.com/documentation/coreml/mlcomputeunits/cpuandneuralengine),
-[Compute Plan](https://apple.github.io/coremltools/docs-guides/source/mlmodel-utilities.html)
-i [wykonanie FP16](https://apple.github.io/coremltools/docs-guides/source/typed-execution.html).
+Apple documentation: [selecting the CPU and Neural Engine](https://developer.apple.com/documentation/coreml/mlcomputeunits/cpuandneuralengine),
+[Compute Plan](https://apple.github.io/coremltools/docs-guides/source/mlmodel-utilities.html),
+and [FP16 execution](https://apple.github.io/coremltools/docs-guides/source/typed-execution.html).
 
-## Uruchomienie
+## Running the project
 
 ```bash
 python -m unittest discover -s tests -v
@@ -369,34 +372,37 @@ python -m pip install '.[demo]'
 python examples/train_digits.py
 ```
 
-Zestaw testów obejmuje również izolację planów backendów: fuzja elementwise w
-planie CUDA lub OpenCL nie może zmienić przenośnego grafu ani planu innego
-backendu. Ostatnia pełna weryfikacja objęła 70 testów; 14 opcjonalnych testów
-backendów niedostępnych na tym hoście zostało pominiętych.
+The test suite also checks backend-plan isolation: an elementwise fusion in a
+CUDA or OpenCL plan must not change the portable graph or another backend's
+plan. The latest complete verification ran 70 tests; 14 optional tests for
+backends unavailable on this host were skipped.
 
-Demo trenuje MLP `64 -> 48 -> 10` na wbudowanym w scikit-learn darmowym
-zbiorze cyfr 8×8. Skrypt kończy się błędem, jeśli test accuracy nie osiągnie 90%.
+The demo trains a `64 -> 48 -> 10` MLP on scikit-learn's bundled, freely
+available 8x8 digits dataset. The script fails if test accuracy does not reach
+90%.
 
 ## Transformer
 
-`MATMUL` obsługuje także batch dimensions, dlatego ten sam sześciooperacyjny IR
-pokrywa wielogłowe attention bez specjalnej instrukcji. Pakiet zawiera
-`LayerNorm`, `MultiHeadSelfAttention` i pre-norm `TransformerEncoderBlock`.
+`MATMUL` also supports batch dimensions, so the same six-operation IR covers
+multi-head attention without a dedicated instruction. The package includes
+`LayerNorm`, `MultiHeadSelfAttention`, and a pre-norm
+`TransformerEncoderBlock`.
 
-Drugi przykład traktuje osiem wierszy obrazu cyfry jako osiem tokenów. Używa
-embeddingu 32, dwóch bloków encodera, czterech głów, MLP 64 i mean poolingu:
+The second example treats the eight rows of a digit image as eight tokens. It
+uses a 32-dimensional embedding, two encoder blocks, four heads, a 64-unit MLP,
+and mean pooling:
 
 ```bash
 python examples/train_digits_transformer.py --compiler cpu
 .venv/bin/python examples/train_digits_transformer.py --compiler mlx
 ```
 
-## Benchmark względem tinygrad
+## Benchmark against tinygrad
 
-Główny benchmark uruchamia Chomika, tinygrad i opcjonalne warianty PyTorch w
-osobnych procesach, aby ich runtime'y GPU nie wpływały na siebie. Obejmuje osiem
-operacji tensorowych, 20 epok MLP i 10 epok transformera. Kontroluje zgodność
-wyników oraz accuracy; nie zawiera niestabilnych progów czasowych:
+The main benchmark runs Chomik, tinygrad, and optional PyTorch variants in
+separate processes so their GPU runtimes do not affect one another. It covers
+eight tensor operations, 20 MLP epochs, and 10 transformer epochs. It validates
+result compatibility and accuracy without unstable timing thresholds:
 
 ```bash
 .venv/bin/python -m pip install '.[benchmark]'
@@ -404,109 +410,112 @@ wyników oraz accuracy; nie zawiera niestabilnych progów czasowych:
 .venv/bin/python benchmarks/compare_tinygrad_10_cases.py --json
 ```
 
-Na NVIDIA/CUDA użyj `--device cuda`, dla OpenCL `--device opencl`, a dla Vulkan
-`--device vulkan`; domyślny tryb `metal` zachowuje dotychczasowe zachowanie na
-Apple Silicon. Flaga `--micro-only` pomija dwa długie przypadki treningowe.
-Opcja `--chomik-jit` przechwytuje oba treningi Chomika na CUDA albo OpenCL.
+Use `--device cuda` for NVIDIA/CUDA, `--device opencl` for OpenCL, or
+`--device vulkan` for Vulkan. The default `metal` mode preserves the existing
+Apple Silicon behavior. `--micro-only` skips the two longer training cases.
+`--chomik-jit` captures both Chomik training workloads on CUDA or OpenCL.
 
-Skrypt `benchmarks/transformer_vs_tinygrad.py` pozostaje krótszym benchmarkiem
-samego transformera.
+`benchmarks/transformer_vs_tinygrad.py` remains available as a shorter,
+transformer-only benchmark.
 
-Przykładowy wynik głównego benchmarku na Apple M1 Max (`tinygrad 0.14.0`,
+Example result from the main benchmark on an Apple M1 Max (`tinygrad 0.14.0`,
 `mlx 0.32.1`):
 
-| przypadek | Chomik | tinygrad |
+| case | Chomik | tinygrad |
 |---|---:|---:|
-| elementwise, 1M | **0,75 ms** | 1,82 ms |
-| reduce sum, 4M | **0,74 ms** | 1,60 ms |
-| softmax, 1024×1024 | **0,65 ms** | 1,95 ms |
-| matmul, 64×64 | **0,29 ms** | 2,41 ms |
-| matmul, 256×256 | **0,33 ms** | 2,46 ms |
-| matmul, 1024×1024 | **1,57 ms** | 3,24 ms |
-| matmul, 2048×2048 | **5,35 ms** | 6,59 ms |
-| batched matmul, 16×4×64 | **0,40 ms** | 2,67 ms |
-| trening MLP, 20 epok | **0,37 s** | 1,06 s |
-| trening transformera, 10 epok | **1,46 s** | 1,63 s |
+| elementwise, 1M | **0.75 ms** | 1.82 ms |
+| reduce sum, 4M | **0.74 ms** | 1.60 ms |
+| softmax, 1024x1024 | **0.65 ms** | 1.95 ms |
+| matmul, 64x64 | **0.29 ms** | 2.41 ms |
+| matmul, 256x256 | **0.33 ms** | 2.46 ms |
+| matmul, 1024x1024 | **1.57 ms** | 3.24 ms |
+| matmul, 2048x2048 | **5.35 ms** | 6.59 ms |
+| batched matmul, 16x4x64 | **0.40 ms** | 2.67 ms |
+| MLP training, 20 epochs | **0.37 s** | 1.06 s |
+| transformer training, 10 epochs | **1.46 s** | 1.63 s |
 
-To mały model, więc wynik mierzy również narzut kompilacji i Pythona. Na innych
-wersjach bibliotek oraz układach Apple proporcje mogą być inne.
+This is a small model, so the result also measures Python and compilation
+overhead. Ratios may differ with other library versions and Apple chips.
 
-Na NVIDIA GeForce RTX 5070 Ti (`CuPy 14.2.0`, `tinygrad 0.14.0`,
-`PyTorch 2.13.0+cu130`, Python 3.14.2) pełny przebieg
-`--device cuda --trials 3` dał następujące mediany:
+On an NVIDIA GeForce RTX 5070 Ti (`CuPy 14.2.0`, `tinygrad 0.14.0`,
+`PyTorch 2.13.0+cu130`, Python 3.14.2), a complete
+`--device cuda --trials 3` run produced these medians:
 
-| przypadek | Chomik CUDA | tinygrad CUDA | PyTorch eager | PyTorch compile/CUDA Graphs |
+| case | Chomik CUDA | tinygrad CUDA | PyTorch eager | PyTorch compile/CUDA Graphs |
 |---|---:|---:|---:|---:|
-| elementwise, 1M | 1,554 ms | 2,767 ms | **0,971 ms** | 1,241 ms |
-| reduce sum, 4M | 1,295 ms | 1,965 ms | **0,925 ms** | 1,422 ms |
-| softmax, 1024×1024 | 1,248 ms | 2,689 ms | **0,656 ms** | 0,825 ms |
-| matmul, 64×64 | 0,116 ms | 2,301 ms | **0,108 ms** | 0,187 ms |
-| matmul, 256×256 | 0,215 ms | 2,385 ms | **0,186 ms** | 0,246 ms |
-| matmul, 1024×1024 | 1,607 ms | 3,876 ms | **0,980 ms** | 1,281 ms |
-| matmul, 2048×2048 | 6,689 ms | 9,948 ms | **3,981 ms** | 4,362 ms |
-| batched matmul, 16×4×64 | 0,667 ms | 2,921 ms | **0,367 ms** | 0,541 ms |
-| trening MLP, 20 epok | 0,563 s | 1,233 s | **0,253 s** | 0,375 s |
-| trening transformera, 10 epok | 1,682 s | 1,722 s | **1,007 s** | 1,718 s |
+| elementwise, 1M | 1.554 ms | 2.767 ms | **0.971 ms** | 1.241 ms |
+| reduce sum, 4M | 1.295 ms | 1.965 ms | **0.925 ms** | 1.422 ms |
+| softmax, 1024x1024 | 1.248 ms | 2.689 ms | **0.656 ms** | 0.825 ms |
+| matmul, 64x64 | 0.116 ms | 2.301 ms | **0.108 ms** | 0.187 ms |
+| matmul, 256x256 | 0.215 ms | 2.385 ms | **0.186 ms** | 0.246 ms |
+| matmul, 1024x1024 | 1.607 ms | 3.876 ms | **0.980 ms** | 1.281 ms |
+| matmul, 2048x2048 | 6.689 ms | 9.948 ms | **3.981 ms** | 4.362 ms |
+| batched matmul, 16x4x64 | 0.667 ms | 2.921 ms | **0.367 ms** | 0.541 ms |
+| MLP training, 20 epochs | 0.563 s | 1.233 s | **0.253 s** | 0.375 s |
+| transformer training, 10 epochs | 1.682 s | 1.722 s | **1.007 s** | 1.718 s |
 
-PyTorch eager wygrał wszystkie dziesięć przypadków. Kontrole fingerprintów i
-accuracy przeszły dla wszystkich frameworków. Mikrobenchmarki obejmują transfer
-wejścia z NumPy na GPU oraz odczyt wyniku z powrotem do NumPy. Fused backward
-softmax i LayerNorm skrócił trening transformera z 2,257 s do 1,682 s.
+PyTorch eager won all ten cases. Fingerprint and accuracy checks passed for
+every framework. The microbenchmarks include NumPy-to-GPU input transfer and
+NumPy result readback. Fused softmax and LayerNorm backward reduced transformer
+training time from 2.257 s to 1.682 s.
 
-Po dodaniu CUDA JIT wykonano pięć naprzemiennych prób eager/JIT w jednym
-procesie. Mediany dla aktualnej implementacji wyniosły:
+After adding CUDA JIT, five alternating eager/JIT trials were run in one
+process. The current implementation produced these medians:
 
-| trening | Chomik CUDA | Chomik CUDA JIT | przyspieszenie |
+| training workload | Chomik CUDA | Chomik CUDA JIT | speedup |
 |---|---:|---:|---:|
-| MLP, 20 epok | 0,427 s | **0,233 s** | 1,83× |
-| transformer, 10 epok | 1,640 s | **0,987 s** | 1,66× |
+| MLP, 20 epochs | 0.427 s | **0.233 s** | 1.83x |
+| transformer, 10 epochs | 1.640 s | **0.987 s** | 1.66x |
 
-Accuracy pozostało w dotychczasowym zakresie. Te liczby są osobną serią A/B i
-nie należy mieszać ich z wcześniejszą czteroframeworkową tabelą, wykonaną przy
-innym obciążeniu GPU.
+Accuracy remained within its previous range. These numbers are a separate A/B
+series and should not be mixed with the earlier four-framework table, which was
+measured under a different GPU load.
 
-### Inference rdzenia LLM około 1B
+### Inference of an approximately 1B-parameter LLM core
 
-Drugi benchmark buduje decoder-only transformer core bez embeddingu,
-tokenizera i LM headu. Domyślna konfiguracja ma 20 bloków, szerokość 2048,
-16 głów, FFN 8192, sekwencję 32 i dokładnie 1 007 169 536 parametrów:
+The second benchmark builds a decoder-only transformer core without an
+embedding, tokenizer, or LM head. Its default configuration has 20 blocks,
+width 2,048, 16 heads, an 8,192-unit FFN, sequence length 32, and exactly
+1,007,169,536 parameters:
 
 ```bash
 .venv/bin/python benchmarks/llm_1b_inference.py
 .venv/bin/python benchmarks/llm_1b_inference.py --json
 ```
 
-Na NVIDIA/CUDA uruchom ten sam model przez
+Run the same model on NVIDIA/CUDA with
 `python benchmarks/llm_1b_inference.py --device cuda`.
 
-Na M1 Max, FP32 i `batch=1` mediana dziesięciu rozgrzanych forwardów wyniosła
-32,83 ms dla Chomika oraz 40,38 ms dla tinygrad. Pierwszy forward trwał
-odpowiednio 0,62 s i 2,63 s. Jest to prefill syntetycznych hidden states, a nie
-autoregresywne generowanie z KV cache.
+On an M1 Max with FP32 and `batch=1`, the median of ten warm forwards was
+32.83 ms for Chomik and 40.38 ms for tinygrad. Their first forwards took 0.62 s
+and 2.63 s respectively. This is a prefill of synthetic hidden states, not
+autoregressive generation with a KV cache.
 
-Na RTX 5070 Ti ten sam benchmark FP32 (`--device cuda --warm-runs 30`) dał
-zgodne fingerprinty wyjścia i następujące wyniki:
+On an RTX 5070 Ti, the same FP32 benchmark
+(`--device cuda --warm-runs 30`) produced matching output fingerprints and the
+following results:
 
-| metryka | Chomik CUDA | tinygrad CUDA | PyTorch eager | PyTorch compile/CUDA Graphs |
+| metric | Chomik CUDA | tinygrad CUDA | PyTorch eager | PyTorch compile/CUDA Graphs |
 |---|---:|---:|---:|---:|
-| inicjalizacja modelu | 6,644 s | **6,052 s** | 6,516 s | 6,480 s |
-| pierwszy forward | 0,542 s | 3,699 s | **0,156 s** | 3,372 s |
-| mediana 30 rozgrzanych forwardów | **9,69 ms** | 61,61 ms | 10,79 ms | 12,26 ms |
-| peak RAM procesu | 4583,1 MiB | 7917,4 MiB | **1048,3 MiB** | 1219,2 MiB |
-| pamięć GPU raportowana przez runtime | 3990,3 MiB | **3844,4 MiB** | 3877,1 MiB | 3877,1 MiB |
+| model initialization | 6.644 s | **6.052 s** | 6.516 s | 6.480 s |
+| first forward | 0.542 s | 3.699 s | **0.156 s** | 3.372 s |
+| median of 30 warm forwards | **9.69 ms** | 61.61 ms | 10.79 ms | 12.26 ms |
+| process peak RAM | 4,583.1 MiB | 7,917.4 MiB | **1,048.3 MiB** | 1,219.2 MiB |
+| runtime-reported GPU memory | 3,990.3 MiB | **3,844.4 MiB** | 3,877.1 MiB | 3,877.1 MiB |
 
-Chomik wygrał rozgrzany forward: był 1,11× szybszy od PyTorch eager, 1,26× od
-CUDA Graphs i 6,36× od tinygrad. Backend kompiluje graf raz, spłaszcza projekcje
-liniowe do 2D GEMM i używa jednego kernela FP32 dla LayerNorm. Model ma
-1 007 169 536 losowych parametrów FP32 (3,752 GiB samych wag); benchmark nie
-zawiera embeddingu, tokenizera, LM headu, KV cache ani generowania tokenów.
+Chomik won the warm forward: it was 1.11x faster than PyTorch eager, 1.26x
+faster than CUDA Graphs, and 6.36x faster than tinygrad. The backend compiles
+the graph once, flattens linear projections into 2D GEMMs, and uses one FP32
+kernel for LayerNorm. The model contains 1,007,169,536 random FP32 parameters
+(3.752 GiB for weights alone); the benchmark includes no embedding, tokenizer,
+LM head, KV cache, or token generation.
 
-### Trening rdzenia LLM około 1B
+### Training an approximately 1B-parameter LLM core
 
-Benchmark treningowy wykonuje na tym samym rdzeniu syntetyczny MSE oraz SGD
-z `lr=1e-3`. Mierzy pierwszy krok i medianę kolejnych kroków, a zgodność Chomika
-z PyTorch kontroluje przez fingerprint gradientu i zaktualizowanej wagi końcowej
-normalizacji:
+The training benchmark runs a synthetic MSE objective and SGD with `lr=1e-3`
+on the same core. It measures the first step and the median of subsequent steps.
+Chomik and PyTorch compatibility is checked through fingerprints of the
+gradient and the updated final-normalization weight:
 
 ```bash
 python benchmarks/llm_1b_training.py --steps 12
@@ -514,35 +523,37 @@ python benchmarks/llm_1b_training.py --steps 12 --inplace-sgd
 python benchmarks/llm_1b_training.py --steps 12 --inplace-sgd --json
 ```
 
-Na RTX 5070 Ti, FP32, `batch=1` i sekwencji 32 oba frameworki ukończyły 12
-kroków bez OOM. Poniższy przebieg używa `--inplace-sgd` dla Chomika:
+On an RTX 5070 Ti with FP32, `batch=1`, and sequence length 32, both frameworks
+completed 12 steps without running out of memory. The run below uses
+`--inplace-sgd` for Chomik:
 
-| metryka | Chomik CUDA | PyTorch eager |
+| metric | Chomik CUDA | PyTorch eager |
 |---|---:|---:|
-| inicjalizacja modelu | 6,533 s | **6,485 s** |
-| materializacja wag Chomika na GPU | 0,372 s | — |
-| pierwszy `forward + backward + SGD` | **272,9 ms** | 293,6 ms |
-| mediana 11 rozgrzanych kroków | 65,4 ms | **51,9 ms** |
-| peak RAM procesu | 4588,1 MiB | **1186,6 MiB** |
-| pamięć GPU raportowana przez runtime | 7795,4 MiB | **7750,4 MiB** |
+| model initialization | 6.533 s | **6.485 s** |
+| materializing Chomik weights on the GPU | 0.372 s | — |
+| first `forward + backward + SGD` | **272.9 ms** | 293.6 ms |
+| median of 11 warm steps | 65.4 ms | **51.9 ms** |
+| process peak RAM | 4,588.1 MiB | **1,186.6 MiB** |
+| runtime-reported GPU memory | 7,795.4 MiB | **7,750.4 MiB** |
 
-Optymalizacja usuwa redukcje po osiach długości jeden, kieruje singleton-batch
-do 2D GEMM, scala backward softmax do jednego kernela, scala trzy gradienty
-LayerNorm we wspólne wywołanie CUDA oraz wykonuje aktualizację SGD jednym
-kernelem. Względem poprzedniego pomiaru pierwszy krok Chomika skrócił się
-z 335,8 ms do 272,9 ms, a warm step z 91,1 ms do 65,4 ms, czyli o 28,2%.
-Analiza czasu życia buforów zwalnia wyniki po ostatnim użyciu i obniżyła peak
-domyślnego trybu z 11817,8 MiB do 11635,7 MiB. Opcjonalny in-place SGD usuwa
-kopię nowych wag i obniża peak dalej do 7795,4 MiB, tylko o 45,0 MiB (0,6%)
-więcej od PyTorch. Warm step Chomika pozostaje o 26,1% wolniejszy.
+The optimization removes reductions over length-one axes, routes singleton
+batches to 2D GEMM, fuses softmax backward into one kernel, combines all three
+LayerNorm gradients into one CUDA call, and performs the SGD update with one
+kernel. Compared with the previous measurement, Chomik's first step fell from
+335.8 ms to 272.9 ms, while its warm step fell from 91.1 ms to 65.4 ms, a 28.2%
+improvement. Buffer lifetime analysis releases results after their final use
+and reduced the default mode's peak from 11,817.8 MiB to 11,635.7 MiB. Optional
+in-place SGD removes the new-weight copy and lowers the peak further to
+7,795.4 MiB, only 45.0 MiB (0.6%) above PyTorch. Chomik's warm step remains
+26.1% slower.
 
-## Pełne generowanie realnym modelem 1.1B
+## Complete generation with a real 1.1B model
 
-Przykład `generate_tinyllama.py` uruchamia prawdziwy
-`TinyLlama/TinyLlama-1.1B-Chat-v1.0`: pobiera przypiętą rewizję wag, renderuje
-chat template, tokenizuje prompt, wykonuje embedding, 22 bloki Llama, LM head,
-greedy decoding albo sampling i dekoduje odpowiedź. Wagi mają 1 100 048 384
-parametry BF16 i pozostają w natywnej pamięci MLX.
+The `generate_tinyllama.py` example runs the real
+`TinyLlama/TinyLlama-1.1B-Chat-v1.0`: it downloads a pinned weight revision,
+renders the chat template, tokenizes the prompt, runs the embedding, 22 Llama
+blocks, and LM head, performs greedy decoding or sampling, and decodes the
+response. Its 1,100,048,384 BF16 parameters remain in native MLX memory.
 
 ```bash
 .venv/bin/python -m pip install '.[llm,mlx]'
@@ -552,127 +563,168 @@ parametry BF16 i pozostają w natywnej pamięci MLX.
   --temperature 0.7 --top-k 50 --max-new-tokens 32
 ```
 
-Pierwsze uruchomienie pobiera około 2,2 GB do standardowego cache Hugging Face;
-wagi nie trafiają do repozytorium. Rewizja modelu jest przypięta do
-`fe8a4ea1ffedaf415f4da2f062534de366a451e6`, aby przykład był powtarzalny.
+The first run downloads about 2.2 GB into the standard Hugging Face cache; the
+weights are not stored in the repository. The model revision is pinned to
+`fe8a4ea1ffedaf415f4da2f062534de366a451e6` for reproducibility.
 
-Prefill tworzy cache K/V, a każdy kolejny krok aktualizuje go maską. Embedding,
-RoPE, grouped-query attention, RMSNorm, SiLU, cache K/V i wybór ostatniej pozycji
-nadal składają się wyłącznie z sześciu instrukcji IR opisanych wyżej. Backend
-MLX może rozpoznawać przenośne podgrafy RMSNorm, RoPE i attention i opuszczać
-je do szybszych kerneli; inne backendy wykonują ich zwykłe rozwinięcia.
-`TinyLlamaRuntime` materializuje wagi tylko raz i cache'uje programy prefill
-według kształtu oraz decode według długości cache. Dane tokenów i K/V są nadal
-wiązane osobno dla każdego żądania.
+Prefill creates the KV cache, and every subsequent step updates it with a mask.
+The embedding, RoPE, grouped-query attention, RMSNorm, SiLU, KV cache, and final
+position selection are still composed exclusively from the six IR instructions
+described above. The MLX backend can recognize portable RMSNorm, RoPE, and
+attention subgraphs and lower them to faster kernels; other backends execute
+their regular expansions. `TinyLlamaRuntime` materializes weights only once and
+caches prefill programs by shape and decode programs by cache length. Token and
+KV data are still bound separately for every request.
 
-Dla domyślnego promptu model generuje:
+For the default prompt, the model generates:
 
 ```text
 The capital of France is Paris.
 ```
 
-Aktualne porównanie z MLX-LM uruchamia oba runtime'y w osobnych procesach,
-materializuje wagi przed pomiarem i sprawdza identyczność tokenów:
+The current MLX-LM comparison runs both runtimes in separate processes,
+materializes weights before measurement, and checks token identity:
 
 ```bash
 .venv/bin/python -m pip install '.[benchmark,llm]'
 .venv/bin/python benchmarks/tinyllama_vs_mlx_lm.py --trials 9
 ```
 
-Przykładowy wynik na Apple M1 Max (`MLX 0.32.1`, `MLX-LM 0.31.3`, 28 tokenów
-promptu i osiem tokenów odpowiedzi):
+Example result on an Apple M1 Max (`MLX 0.32.1`, `MLX-LM 0.31.3`, a 28-token
+prompt, and eight response tokens):
 
 | TinyLlama 1.1B BF16 | Chomik | MLX-LM |
 |---|---:|---:|
-| pierwszy token, zimny graf | **0,077 s** | 0,121 s |
-| pełna odpowiedź, zimny graf | **0,157 s** | 0,201 s |
-| pierwszy token po rozgrzaniu | **0,024 s** | 0,041 s |
-| rozgrzany decode | 118,9 tokenu/s | **130,4 tokenu/s** |
-| pełna odpowiedź po rozgrzaniu | **0,084 s** | 0,094 s |
-| szczyt pamięci GPU | 2,118 GiB | 2,120 GiB |
+| first token, cold graph | **0.077 s** | 0.121 s |
+| complete response, cold graph | **0.157 s** | 0.201 s |
+| first token after warm-up | **0.024 s** | 0.041 s |
+| warm decode | 118.9 tokens/s | **130.4 tokens/s** |
+| complete response after warm-up | **0.084 s** | 0.094 s |
+| peak GPU memory | 2.118 GiB | 2.120 GiB |
 
-Chomik osiąga około 91% przepustowości decode natywnego MLX-LM, a dzięki cache
-całych programów ma krótszy TTFT dla powtarzanego kształtu. Wszystkie osiem
-identyfikatorów tokenów jest identyczne w obu implementacjach.
+Chomik reaches about 91% of native MLX-LM's decode throughput and has a shorter
+TTFT for repeated shapes thanks to its whole-program cache. All eight token IDs
+are identical in both implementations.
 
-### Eksperyment TinyLlama względem tinygrad
+### TinyLlama experiment against tinygrad
 
-Porównanie wykonano na Apple M1 Max, macOS 27.0 i Pythonie 3.11.14. Chomik
-używał MLX 0.32.1. tinygrad pochodził z oficjalnego taga
-[`v0.14.0`](https://github.com/tinygrad/tinygrad/tree/v0.14.0), commit
-`6f87158`; użyto jego implementacji `tinygrad.llm.model.Transformer`, `TinyJit`
-i cache K/V. Tag źródłowy był konieczny, ponieważ koło 0.14.0 z PyPI nie
-zawierało w testowanym środowisku katalogu `tinygrad.llm.kernels`.
+The comparison was run on an Apple M1 Max, macOS 27.0, and Python 3.11.14.
+Chomik used MLX 0.32.1. tinygrad came from the official
+[`v0.14.0`](https://github.com/tinygrad/tinygrad/tree/v0.14.0) tag at commit
+`6f87158`; the test used its `tinygrad.llm.model.Transformer` implementation,
+`TinyJit`, and KV cache. The source tag was required because the 0.14.0 PyPI
+wheel did not include the `tinygrad.llm.kernels` directory in the tested
+environment.
 
-Oba frameworki dostały te same wagi, aktywacje i cache K/V w BF16, przypiętą
-rewizję TinyLlama, ten sam 28-tokenowy chat prompt, `batch=1`, kontekst 36,
-czysty greedy argmax i limit ośmiu nowych tokenów. Ponieważ oficjalny model
-tinygrad konwertuje embedding do FP32 i cache do FP16, w tymczasowej kopii taga
-te dwa casty ustawiono na BF16; Gumbel sampling zastąpiono równoważnym dla
-temperatury zero bezpośrednim `argmax`. Wagi były już w lokalnym cache, a ich
-ładowanie nie wchodziło do pomiaru. Dla obu frameworków wykonano po sześć
-generacji. Wynik warm jest medianą ostatnich czterech prób; cache promptu był
-resetowany, więc oba frameworki ponownie wykonywały prefill.
+Both frameworks received the same BF16 weights, activations, and KV cache, the
+same pinned TinyLlama revision, the same 28-token chat prompt, `batch=1`, context
+length 36, direct greedy argmax, and a limit of eight new tokens. Because the
+official tinygrad model converts the embedding to FP32 and the cache to FP16,
+those two casts were changed to BF16 in a temporary copy of the tag. Gumbel
+sampling was replaced by direct `argmax`, which is equivalent at zero
+temperature. The weights were already in the local cache, and loading time was
+excluded. Each framework performed six generations. The warm result is the
+median of the final four runs; the prompt cache was reset, so both frameworks
+performed prefill again.
 
 | TinyLlama 1.1B, Metal | Chomik | tinygrad 0.14.0 |
 |---|---:|---:|
-| pierwszy token, zimny JIT | **0,078 s** | 2,585 s |
-| pełne osiem tokenów, zimny JIT | **0,174 s** | 4,335 s |
-| pierwszy token po capture | **0,024 s** | 0,389 s |
-| pełne osiem tokenów po capture | **0,085 s** | 0,550 s |
-| rozgrzany decode | **117,9 tokenu/s** | 43,6 tokenu/s |
-| pamięć urządzenia | 2,118 GiB | **2,052 GiB** |
+| first token, cold JIT | **0.078 s** | 2.585 s |
+| complete eight tokens, cold JIT | **0.174 s** | 4.335 s |
+| first token after capture | **0.024 s** | 0.389 s |
+| complete eight tokens after capture | **0.085 s** | 0.550 s |
+| warm decode | **117.9 tokens/s** | 43.6 tokens/s |
+| device memory | 2.118 GiB | **2.052 GiB** |
 
-W stałym decode Chomik był około 2,7 raza szybszy, a cała krótka odpowiedź po
-rozgrzaniu zajmowała około 6,5 raza mniej czasu. Największa różnica wystąpiła
-przy zimnym JIT: tinygrad potrzebował dwóch wolnych przebiegów na capture i
-kompilację. tinygrad zużył około 3% mniej pamięci urządzenia.
+In steady decode, Chomik was about 2.7x faster, while the complete short response
+after warm-up took about 6.5x less time. The largest gap occurred with a cold
+JIT: tinygrad needed two slow runs for capture and compilation. tinygrad used
+about 3% less device memory.
 
-W obu przypadkach powstały identyczne identyfikatory tokenów:
+Both implementations produced identical token IDs:
 
 ```text
 1576, 7483, 310, 3444, 338, 3681, 29889, 2
 The capital of France is Paris.
 ```
 
-Porównanie wyrównuje dtype przechowywanych tensorów. Wewnętrzna precyzja
-akumulacji pozostaje decyzją kernela każdego frameworka. Zweryfikowano
-identyczne tokeny wynikowe, nie bitową identyczność wszystkich logits. Dla
-dłuższych kontekstów i odpowiedzi proporcje mogą się zmienić.
+The comparison aligns stored tensor dtypes. Internal accumulation precision
+remains a kernel-level choice in each framework. Generated token identity was
+verified, not bitwise identity of every logit. The ratios may change with longer
+contexts and responses.
 
-### Eksperymentalne speculative decoding
+### Why Chomik performs well against tinygrad
 
-`LlamaDecoderBlock` weryfikuje kilka pozycji w jednym grafie, korzystając z
-tych samych sześciu operacji IR. Mechanizm nie należy do backendu MLX, więc
-przyszły backend CUDA albo Vulkan może skompilować dokładnie ten sam blok.
-Greedy runtime potrafi opcjonalnie użyć przypiętego
-`Felladrin/Llama-68M-Chat-v1` jako draftu. Przy ładowaniu sprawdza pełną mapę
-32 000 tokenów, a model docelowy akceptuje kandydatów tylko do pierwszej
-różnicy:
+These results do not mean that Chomik is a more capable general-purpose
+compiler than tinygrad. Chomik is deliberately narrower: its low-level IR has
+only six operations, shapes are static during compilation, and a graph is
+lowered once to a straight-line backend program. Structurally identical graphs
+reuse the compiled program and replace only their dynamic inputs.
+
+Chomik also delegates most device-specific optimization to mature native
+runtimes. The MLX backend calls optimized MLX primitives, including fast
+RMSNorm, RoPE, and scaled dot-product attention. The CUDA backend uses
+CuPy/cuBLAS, flattens compatible projections into 2D GEMMs, and provides
+specialized kernels for LayerNorm and selected backward passes. Parameters and
+KV caches stay on the GPU, while synchronization is deferred until a result is
+actually read.
+
+tinygrad solves a broader problem. It performs more of its own scheduling,
+kernel generation, buffer management, and device abstraction across a much
+wider range of operations and hardware. That generality has a measurable
+runtime and compilation cost, especially for small operations and short,
+fixed-shape workloads. The reported tinygrad 0.14.0 runs used the default
+`TinyJit` path without optional BEAM search or workload-specific tuning.
+
+The comparison still controls the important numerical variables: frameworks
+run in separate processes with the same weights, stored dtypes, inputs, and
+shapes; warm-up is performed; transfers and result readback are included in the
+microbenchmarks; and fingerprints, accuracy, or generated token IDs are checked.
+The large gaps on small matrix multiplications therefore mostly measure runtime
+overhead, while the gap becomes much smaller for large GEMMs and transformer
+training.
+
+There are two useful reality checks. Native MLX-LM remains faster in steady
+TinyLlama decode (about 130 versus 118 tokens/s), and PyTorch eager wins all ten
+general CUDA microbenchmarks and training cases. Chomik's strongest results come
+from static graphs that match its backend lowerings particularly well. A new
+Vulkan or other backend does not inherit this performance automatically; it
+must provide equally good kernels and lowering choices while preserving the
+same portable six-operation IR.
+
+### Experimental speculative decoding
+
+`LlamaDecoderBlock` verifies several positions in one graph using the same six
+IR operations. The mechanism is not part of the MLX backend, so a future CUDA
+or Vulkan backend can compile exactly the same block. The greedy runtime can
+optionally use the pinned `Felladrin/Llama-68M-Chat-v1` as its draft model. At
+load time it checks the complete 32,000-token mapping, and the target model
+accepts candidates only up to the first mismatch:
 
 ```bash
 PYTHONPATH=. .venv/bin/python examples/generate_tinyllama.py \
   --speculative-tokens 6 --temperature 0
 ```
 
-Opcja jest domyślnie wyłączona. W BF16 blokowy target może użyć innego kernela
-Metal niż pojedynczy decode, a więc zmienić kolejność akumulacji. To nie zmienia
-dtype ani matematycznego algorytmu, ale po kilku zaakceptowanych tokenach
-zaokrąglenia cache K/V mogą prowadzić do innego `argmax`. Z tego powodu ten
-eksperyment nie spełnia jeszcze rygorystycznego wymagania identycznych tokenów.
+The option is disabled by default. In BF16, the block target may use a different
+Metal kernel than single-token decode and therefore change accumulation order.
+This changes neither dtype nor the mathematical algorithm, but KV-cache
+rounding after several accepted tokens can eventually lead to a different
+`argmax`. The experiment therefore does not yet meet the strict identical-token
+requirement.
 
-Powtarzalny benchmark obejmuje dziesięć promptów, wykonuje warianty w osobnych
-procesach i raportuje zarówno czas, jak i identyczność całej sekwencji:
+The reproducible benchmark covers ten prompts, runs variants in separate
+processes, and reports both elapsed time and full-sequence identity:
 
 ```bash
 PYTHONPATH=. .venv/bin/python benchmarks/tinyllama_speculative.py \
   --trials 3 --speculative-tokens 6
 ```
 
-Na Apple M1 Max osiem z dziesięciu przypadków zachowało identyczne tokeny, a
-tylko trzy były szybsze. Speedup wynosił od 1,00 do 1,06 raza w wygranych
-przypadkach, natomiast najgorszy przypadek był około 3,6 raza wolniejszy.
-Wniosek: przenośna infrastruktura działa, ale niezależny draft 68M i obecne
-kernele blokowe nie są jeszcze optymalizacją nadającą się do domyślnej ścieżki.
-Do bezpiecznego włączenia potrzeba kernela weryfikującego o zgodnej kolejności
-akumulacji oraz draftu wytrenowanego pod konkretny target.
+On an Apple M1 Max, eight of ten cases preserved identical tokens, while only
+three became faster. Speedups in winning cases ranged from 1.00x to 1.06x; the
+worst case was about 3.6x slower. The conclusion is that the portable
+infrastructure works, but an independent 68M draft and the current block kernels
+are not yet suitable as a default optimization. Safe enablement requires a
+verification kernel with matching accumulation order and a draft trained for
+the specific target.
