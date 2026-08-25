@@ -2,10 +2,31 @@ import unittest
 
 import numpy as np
 
-from chomikgrad import Linear, ReLU, SGD, Sequential, Tensor, cross_entropy
+from chomikgrad import (
+    Linear,
+    ReLU,
+    SGD,
+    Sequential,
+    Tensor,
+    compile_train_step,
+    cross_entropy,
+)
 
 
 class NeuralNetworkTests(unittest.TestCase):
+    def test_compiled_train_step_requires_backend_support(self) -> None:
+        parameter = Linear(1, 1).weight
+        optimizer = SGD([parameter])
+        with self.assertRaisesRegex(
+            RuntimeError, "does not support compiled training steps"
+        ):
+            compile_train_step(
+                lambda inputs: (inputs @ parameter).sum(),
+                optimizer,
+                Tensor.zeros((1, 1)),
+                compiler="cpu",
+            )
+
     def test_inplace_sgd_requires_backend_support(self) -> None:
         parameter = Linear(1, 1).weight
         parameter.grad = Tensor(np.ones(parameter.shape, dtype=np.float32))

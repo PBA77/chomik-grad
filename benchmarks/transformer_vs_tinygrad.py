@@ -34,28 +34,56 @@ def benchmark_chomik(
     seed: int,
     epochs: int,
     batch_size: int,
+    *,
+    compiled: bool = False,
 ) -> Tuple[float, float]:
     rng = np.random.default_rng(seed)
     model = DigitsTransformer(rng)
     optimizer = SGD(model.parameters(), lr=0.03)
 
     started = time.perf_counter()
+    steps = {}
+    if compiled:
+        from chomikgrad import compile_train_step
+
+        def loss_function(inputs: Tensor, targets: Tensor) -> Tensor:
+            logits = model(inputs)
+            return (
+                -(logits.log_softmax(axis=1) * targets).sum()
+                / inputs.shape[0]
+            )
+
+        for size in {batch_size, len(train_x) % batch_size} - {0}:
+            steps[size] = compile_train_step(
+                loss_function,
+                optimizer,
+                Tensor.zeros((size, 8, 8)),
+                Tensor.zeros((size, 10)),
+                compiler=compiler,
+            )
     for _ in range(epochs):
         order = rng.permutation(len(train_x))
         for start in range(0, len(order), batch_size):
             indexes = order[start : start + batch_size]
-            optimizer.zero_grad()
-            loss = cross_entropy(
-                model(
-                    Tensor(
-                        train_x[indexes].reshape(-1, 8, 8),
-                        copy=False,
-                    )
-                ),
-                train_y[indexes],
-            )
-            loss.backward()
-            optimizer.step(compiler=compiler)
+            if compiled:
+                one_hot = np.zeros((len(indexes), 10), dtype=np.float32)
+                one_hot[np.arange(len(indexes)), train_y[indexes]] = 1
+                steps[len(indexes)](
+                    train_x[indexes].reshape(-1, 8, 8), one_hot
+                )
+            else:
+                optimizer.zero_grad()
+                loss = cross_entropy(
+                    model(
+                        Tensor(
+                            train_x[indexes].reshape(-1, 8, 8),
+                            copy=False,
+                        )
+                    ),
+                    train_y[indexes],
+                )
+                loss.backward()
+                optimizer.step(compiler=compiler)
     model.parameters()[0].numpy(compiler=compiler)
     elapsed = time.perf_counter() - started
 

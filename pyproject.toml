@@ -20,6 +20,12 @@ coreml = [
 cuda = [
     "cupy-cuda13x[ctk]>=14.1,<15",
 ]
+opencl = [
+    "pyopencl>=2026.1,<2027",
+]
+vulkan = [
+    "wgpu>=0.31,<0.32; python_version >= '3.11'",
+]
 llm = [
     "huggingface-hub>=0.28",
     "ml-dtypes>=0.5",

@@ -126,8 +126,19 @@ def chomik_mlp_trial(
     train_y: np.ndarray,
     test_y: np.ndarray,
     compiler: str,
+    *,
+    compiled: bool = False,
 ) -> Tuple[float, float]:
-    from chomikgrad import Linear, ReLU, SGD, Sequential, Tensor, cross_entropy, no_grad
+    from chomikgrad import (
+        Linear,
+        ReLU,
+        SGD,
+        Sequential,
+        Tensor,
+        compile_train_step,
+        cross_entropy,
+        no_grad,
+    )
 
     rng = np.random.default_rng(7)
     model = Sequential(
@@ -137,17 +148,40 @@ def chomik_mlp_trial(
     )
     optimizer = SGD(model.parameters(), lr=0.12)
     started = time.perf_counter()
+    steps = {}
+    if compiled:
+
+        def loss_function(inputs: Tensor, targets: Tensor) -> Tensor:
+            logits = model(inputs)
+            return (
+                -(logits.log_softmax(axis=1) * targets).sum()
+                / inputs.shape[0]
+            )
+
+        for size in {64, len(train_x) % 64} - {0}:
+            steps[size] = compile_train_step(
+                loss_function,
+                optimizer,
+                Tensor.zeros((size, 64)),
+                Tensor.zeros((size, 10)),
+                compiler=compiler,
+            )
     for _ in range(20):
         order = rng.permutation(len(train_x))
         for start in range(0, len(order), 64):
             indexes = order[start : start + 64]
-            optimizer.zero_grad()
-            loss = cross_entropy(
-                model(Tensor(train_x[indexes], copy=False)),
-                train_y[indexes],
-            )
-            loss.backward()
-            optimizer.step(compiler=compiler)
+            if compiled:
+                one_hot = np.zeros((len(indexes), 10), dtype=np.float32)
+                one_hot[np.arange(len(indexes)), train_y[indexes]] = 1
+                steps[len(indexes)](train_x[indexes], one_hot)
+            else:
+                optimizer.zero_grad()
+                loss = cross_entropy(
+                    model(Tensor(train_x[indexes], copy=False)),
+                    train_y[indexes],
+                )
+                loss.backward()
+                optimizer.step(compiler=compiler)
     model.parameters()[0].numpy(compiler=compiler)
     elapsed = time.perf_counter() - started
     with no_grad():
@@ -314,8 +348,15 @@ def run_worker(
     repeat_scale: float,
     device: str,
     torch_compile_backend: str,
+    micro_only: bool = False,
+    chomik_jit: bool = False,
 ) -> List[Dict[str, object]]:
-    compiler = "mlx" if device == "metal" else "cuda"
+    compiler = {
+        "metal": "mlx",
+        "cuda": "cuda",
+        "opencl": "opencl",
+        "vulkan": "vulkan",
+    }[device]
     results = []
     for name, arrays in micro_cases():
         repeats = max(1, round(MICRO_REPEATS[name] * repeat_scale))
@@ -371,9 +412,20 @@ def run_worker(
             }
         )
 
+    if micro_only:
+        if framework == "chomik":
+            from chomikgrad import get_compiler
+
+            active_compiler = get_compiler(compiler)
+            if hasattr(active_compiler, "close"):
+                active_compiler.close()
+        return results
+
     train_x, test_x, train_y, test_y = digits_data()
     if framework == "chomik":
-        mlp = lambda *values: chomik_mlp_trial(*values, compiler)
+        mlp = lambda *values: chomik_mlp_trial(
+            *values, compiler, compiled=chomik_jit
+        )
     elif framework == "tinygrad":
         mlp = tinygrad_mlp_trial
     else:
@@ -398,7 +450,15 @@ def run_worker(
 
     if framework == "chomik":
         transformer = lambda: benchmark_chomik(
-            compiler, train_x, test_x, train_y, test_y, 7, 10, 64
+            compiler,
+            train_x,
+            test_x,
+            train_y,
+            test_y,
+            7,
+            10,
+            64,
+            compiled=chomik_jit,
         )
     elif framework == "tinygrad":
         transformer = lambda: benchmark_tinygrad(
@@ -436,7 +496,13 @@ def worker_command(framework: str, arguments: argparse.Namespace) -> List[Dict[s
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     environment["PYTHONPATH"] = str(ROOT)
     if framework == "tinygrad":
-        environment["DEV"] = arguments.device.upper()
+        environment["DEV"] = {
+            "opencl": "CL",
+            "vulkan": "WEBGPU",
+        }.get(arguments.device, arguments.device.upper())
+        if arguments.device == "vulkan":
+            environment["WGPU_BACKEND_TYPE"] = "Vulkan"
+            environment["WEBGPU_BACKEND"] = "WGPUBackendType_Vulkan"
     command = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -451,6 +517,10 @@ def worker_command(framework: str, arguments: argparse.Namespace) -> List[Dict[s
         "--torch-compile-backend",
         arguments.torch_compile_backend,
     ]
+    if arguments.micro_only:
+        command.append("--micro-only")
+    if arguments.chomik_jit:
+        command.append("--chomik-jit")
     completed = subprocess.run(
         command,
         cwd=ROOT,
@@ -475,10 +545,13 @@ def compare(
     *,
     accuracy_atol: float = 1e-9,
 ) -> List[Dict[str, object]]:
-    if not framework_results or any(
-        len(results) != 10 for results in framework_results.values()
+    if not framework_results:
+        raise RuntimeError("expected benchmark results")
+    expected = len(next(iter(framework_results.values())))
+    if expected not in (8, 10) or any(
+        len(results) != expected for results in framework_results.values()
     ):
-        raise RuntimeError("expected exactly ten benchmark cases")
+        raise RuntimeError("expected eight or ten compatible benchmark cases")
     frameworks = tuple(framework_results)
     reference = framework_results[frameworks[0]]
     compared = []
@@ -554,13 +627,27 @@ def main() -> None:
     )
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--repeat-scale", type=float, default=1.0)
-    parser.add_argument("--device", choices=("metal", "cuda"), default="metal")
+    parser.add_argument(
+        "--device",
+        choices=("metal", "cuda", "opencl", "vulkan"),
+        default="metal",
+    )
     parser.add_argument(
         "--torch-compile-backend",
         choices=("cudagraphs", "inductor"),
         default="cudagraphs",
     )
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--micro-only",
+        action="store_true",
+        help="run only the eight tensor microbenchmarks",
+    )
+    parser.add_argument(
+        "--chomik-jit",
+        action="store_true",
+        help="capture and reuse Chomik training graphs",
+    )
     parser.add_argument(
         "--worker",
         choices=("chomik", "tinygrad", "torch-eager", "torch-compile"),
@@ -569,6 +656,8 @@ def main() -> None:
     arguments = parser.parse_args()
     if arguments.trials <= 0 or arguments.repeat_scale <= 0:
         parser.error("trials and repeat scale must be positive")
+    if arguments.chomik_jit and arguments.device != "opencl":
+        parser.error("--chomik-jit currently requires --device opencl")
 
     if arguments.worker:
         print(
@@ -580,6 +669,8 @@ def main() -> None:
                     arguments.repeat_scale,
                     arguments.device,
                     arguments.torch_compile_backend,
+                    arguments.micro_only,
+                    arguments.chomik_jit,
                 )
             )
         )
@@ -593,7 +684,7 @@ def main() -> None:
             framework: worker_command(framework, arguments)
             for framework in frameworks
         },
-        accuracy_atol=0.01 if arguments.device == "cuda" else 1e-9,
+        accuracy_atol=0.01 if arguments.device != "metal" else 1e-9,
     )
     if arguments.json:
         print(json.dumps(results, indent=2))

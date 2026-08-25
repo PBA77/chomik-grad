@@ -323,9 +323,15 @@ class Tensor:
         return self._unary("sqrt")
 
     def softmax(self, axis: int = -1) -> "Tensor":
+        normalized_axis = _normalize_axes(axis, self.ndim)[0]
         maximum = self.max(axis=axis, keepdims=True).detach()
         exponentials = (self - maximum).exp()
         result = exponentials / exponentials.sum(axis=axis, keepdims=True)
+        result._node.lowering = (
+            "softmax",
+            (self._node,),
+            normalized_axis,
+        )
         if not result.requires_grad:
             return result
 
@@ -335,7 +341,6 @@ class Tensor:
             weighted = grad * result
             projection = weighted.sum(axis=axis, keepdims=True)
             contribution = result * (grad - projection)
-            normalized_axis = _normalize_axes(axis, self.ndim)[0]
             contribution._node.lowering = (
                 "softmax_backward",
                 (grad._node, result._node),
@@ -419,9 +424,32 @@ class Tensor:
         return result
 
     def log_softmax(self, axis: int = -1) -> "Tensor":
+        normalized_axis = _normalize_axes(axis, self.ndim)[0]
         maximum = self.max(axis=axis, keepdims=True).detach()
         shifted = self - maximum
-        return shifted - shifted.exp().sum(axis=axis, keepdims=True).log()
+        result = shifted - shifted.exp().sum(axis=axis, keepdims=True).log()
+        result._node.lowering = (
+            "log_softmax",
+            (self._node,),
+            normalized_axis,
+        )
+        if not result.requires_grad:
+            return result
+
+        result._parents = (self,)
+
+        def backward(grad: Tensor) -> BackwardResult:
+            projection = grad.sum(axis=axis, keepdims=True)
+            contribution = grad - result.exp() * projection
+            contribution._node.lowering = (
+                "log_softmax_backward",
+                (grad._node, result._node),
+                normalized_axis,
+            )
+            return ((self, contribution),)
+
+        result._backward = backward
+        return result
 
     def reshape(self, *shape: Union[int, Sequence[int]]) -> "Tensor":
         requested = tuple(shape[0]) if len(shape) == 1 and not isinstance(shape[0], int) else tuple(shape)  # type: ignore[arg-type]

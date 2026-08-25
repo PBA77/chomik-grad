@@ -36,7 +36,7 @@ loss.backward()                    # powstaje lazy graf gradientów
 optimizer.step()                   # kompilacja i wykonanie na CPU
 ```
 
-CUDA SGD może opcjonalnie aktualizować istniejący storage parametrów:
+CUDA i OpenCL SGD mogą opcjonalnie aktualizować istniejący storage parametrów:
 
 ```python
 optimizer = SGD(model.parameters(), lr=0.1, inplace=True)
@@ -102,7 +102,7 @@ register_compiler("my-device", MyCompiler)
 
 `DeviceAdapter` oddziela tworzenie natywnych tablic, synchronizację, odczyt do
 NumPy, `argmax`, mapowanie dtype i opcjonalne ładowanie safetensors od kompilacji
-IR. Dzięki temu przyszły backend CUDA albo Vulkan może użyć tego samego runtime'u
+IR. Dzięki temu kolejny backend, np. Vulkan, może użyć tego samego runtime'u
 inferencji; nadal musi dostarczyć własne sześć loweringów i ewentualne szybkie
 kernele RMSNorm/RoPE/attention. Kompilator można wskazać dla pojedynczej
 realizacji:
@@ -151,6 +151,145 @@ Na natywnym Windows wariant `torch-compile` używa oficjalnego backendu
 `cudagraphs`, ponieważ wheel PyTorch nie zawiera Tritona. Na systemie z
 działającym Tritonem można wybrać pełny Inductor przez
 `--torch-compile-backend inductor`.
+
+## GPU przez OpenCL
+
+Opcjonalna wtyczka `opencl` wykonuje pełny IR FP32 przez PyOpenCL. Operacje
+elementwise, redukcje, reshape, permute, gather i SGD korzystają z własnych
+kerneli, a zwykły, strided-batched i offset-batched `MATMUL` z CLBlast. Forward
+LayerNorm, softmax i log-softmax oraz ich backwardy mają scalone kernele. Łańcuchy
+operacji elementwise o tym samym kształcie i jednym konsumencie są scalane bez
+duplikowania obliczeń. `reshape` i `permute` używają lekkich widoków runtime,
+a aktualizacje SGD są łączone w grupy do 16 parametrów na kernel. Parametry oraz
+gradienty pozostają na GPU między krokami i nie ma cichego fallbacku na CPU.
+
+PyOpenCL instaluje się z extra projektu, natomiast współdzieloną bibliotekę
+CLBlast 1.7 trzeba zainstalować osobno. Jej ścieżkę można podać bezpośrednio:
+
+```powershell
+python -m pip install '.[benchmark,opencl]'
+$env:CLBLAST_PATH='C:\ścieżka\do\clblast.dll'
+python benchmarks\compare_tinygrad_10_cases.py --device opencl --trials 3
+```
+
+Dla powtarzanego kroku treningowego o stałym kształcie batcha można opcjonalnie
+przechwycić forward, backward i SGD tylko raz:
+
+```python
+from chomikgrad import SGD, Tensor, compile_train_step
+
+optimizer = SGD(model.parameters(), lr=0.03)
+
+def loss_function(inputs, targets):
+    logits = model(inputs)
+    return -(logits.log_softmax(axis=1) * targets).sum() / inputs.shape[0]
+
+step = compile_train_step(
+    loss_function,
+    optimizer,
+    Tensor.zeros((64, 8, 8)),
+    Tensor.zeros((64, 10)),
+    compiler="opencl",
+)
+step(batch_inputs, batch_targets_one_hot)
+```
+
+Wejścia mogą zmieniać wartości, lecz muszą zachować kształt i dtype przykładów.
+Dla krótszego ostatniego batcha trzeba utworzyć drugi krok. Domyślnie krok nie
+realizuje wartości loss; `return_loss=True` włącza jej zwracanie do monitoringu.
+
+Na Linuksie `CLBLAST_PATH` może wskazywać `libclblast.so`. Backend sprawdza też
+systemowy loader oraz `Library/bin/clblast.dll` albo `lib/libclblast.so`
+aktywnego virtualenv. Benchmark ustawia dla tinygrad urządzenie `CL`, więc obie
+implementacje używają OpenCL na tym samym GPU.
+
+Backend celowo odrzuca dtype inne niż FP32, z wyjątkiem int32/int64 dla indeksów
+`GATHER`. Sterownik NVIDIA użyty w pomiarze udostępniał OpenCL 3.0, ale tylko
+OpenCL C 1.2 i bez `cl_khr_fp16`, dlatego tryb FP16 nie jest oferowany pozornie
+przez konwersję do FP32.
+
+Na GeForce RTX 5070 Ti (`PyOpenCL 2026.1.3`, `CLBlast 1.7.0`,
+`tinygrad 0.14.0`, Python 3.14.2) pojedynczy pełny przebieg z domyślną liczbą
+powtórzeń mikrobenchmarków dał:
+
+| przypadek | Chomik OpenCL | tinygrad CL |
+|---|---:|---:|
+| elementwise, 1M | **1,964 ms** | 2,886 ms |
+| reduce sum, 4M | **1,327 ms** | 1,799 ms |
+| softmax, 1024×1024 | **1,438 ms** | 2,874 ms |
+| matmul, 64×64 | **0,277 ms** | 2,342 ms |
+| matmul, 256×256 | **0,344 ms** | 2,393 ms |
+| matmul, 1024×1024 | **2,370 ms** | 3,904 ms |
+| matmul, 2048×2048 | **7,864 ms** | 9,556 ms |
+| batched matmul, 16×4×64 | **0,734 ms** | 2,894 ms |
+| trening MLP, 20 epok | 3,092 s | **2,262 s** |
+| trening transformera, 10 epok | 7,776 s | **6,695 s** |
+
+Scalone backwardy, pula buforów, przygotowywanie invokerów tylko raz,
+offset-batched GEMM dla częściowego broadcastu i cache planów offsetów skróciły
+trening transformera z 331,278 s do 7,776 s, czyli 42,6 raza. Chomik wygrał
+wszystkie osiem mikrobenchmarków; tinygrad pozostał o 37% szybszy w treningu MLP
+i o 16% w treningu transformera. Na tym samym GPU backend CUDA nadal pozostaje
+właściwym wyborem dla maksymalnej wydajności.
+
+Osobna seria pięciu pełnych prób treningowych porównała capture po fuzji z
+TinyJit. `--repeat-scale 0.01` skracał wyłącznie mikrobenchmarki i nie zmieniał
+liczby epok:
+
+| wariant | MLP pierwszy | MLP mediana | Transformer pierwszy | Transformer mediana |
+|---|---:|---:|---:|---:|
+| Chomik `compile_train_step` | **1,327 s** | **0,626 s** | **4,250 s** | **2,237 s** |
+| tinygrad `TinyJit` | 3,336 s | 2,217 s | 8,957 s | 2,816 s |
+
+W porównaniu z capture sprzed fuzji mediana Chomika spadła z 1,023 s do 0,626 s
+dla MLP i z 3,965 s do 2,237 s dla transformera. Fuzje softmax i elementwise
+usunęły 28 operacji wykonawczych z grafu transformera, lekkie widoki ograniczyły
+narzut Pythona, a zgrupowane SGD zmniejszyło liczbę kerneli aktualizacji 39 wag
+z 39 do 3 na krok. Po rozgrzaniu Chomik jest 3,54 raza szybszy od tinygrad dla
+MLP i 1,26 raza dla transformera; pierwszy przebieg transformera jest o 52,5%
+krótszy.
+
+## GPU przez Vulkan
+
+Opcjonalna wtyczka `vulkan` używa `wgpu-native`, ale wybiera wyłącznie adapter,
+którego `backend_type` jest równy `Vulkan`; nie może więc przejść po cichu na
+D3D12 ani OpenGL. Każdy lazy graf jest kodowany jako jeden command buffer z
+kernelami WGSL. Reshape i permute zachowują widoki przez stride'y, a tiled
+matmul obsługuje batch i broadcasting bez pętli dispatchy po stronie Pythona.
+Backend obejmuje pełny IR FP32, autograd oraz zwykły i in-place SGD.
+
+`wgpu` wymaga Pythona 3.11 lub nowszego:
+
+```powershell
+python -m pip install '.[benchmark,vulkan]'
+python -m pip install 'dawn-python==0.3.0'
+python benchmarks\compare_tinygrad_10_cases.py --device vulkan --micro-only
+```
+
+Porównanie z tinygrad WEBGPU wymaga dodatkowo `dawn-python==0.3.0`. Skrypt
+ustawia `WEBGPU_BACKEND=WGPUBackendType_Vulkan`, więc Dawn także nie wybiera
+innego API. Indeksy int64 są po sprawdzeniu zakresu zawężane do int32, ponieważ
+WGSL nie udostępnia przenośnego typu int64 dla buforów storage.
+
+Na tej samej GeForce RTX 5070 Ti (`wgpu 0.31.1`, `dawn-python 0.3.0`,
+`tinygrad 0.14.0`) pełny zestaw powtórzeń mikrobenchmarku dał:
+
+| przypadek | Chomik Vulkan | tinygrad WEBGPU/Vulkan |
+|---|---:|---:|
+| elementwise, 1M | **5,111 ms** | 8,427 ms |
+| reduce sum, 4M | **5,535 ms** | 42,152 ms |
+| softmax, 1024×1024 | **3,755 ms** | 52,596 ms |
+| matmul, 64×64 | **0,828 ms** | 3,347 ms |
+| matmul, 256×256 | **0,929 ms** | 3,465 ms |
+| matmul, 1024×1024 | **4,735 ms** | 9,807 ms |
+| matmul, 2048×2048 | **20,517 ms** | 32,764 ms |
+| batched matmul, 16×4×64 | **2,508 ms** | 4,721 ms |
+
+Chomik wygrał wszystkie osiem przypadków. Jego pojedynczy pełny worker wykonał
+20 epok MLP w 1,463 s i 10 epok transformera w 5,911 s. Worker treningowy
+tinygrad/Dawn nie ukończył się w ciągu pięciu minut i został przerwany, dlatego
+nie przypisano mu pozornego wyniku. Dla transformera Chomik Vulkan był 1,32×
+szybszy od OpenCL (7,776 s), ale 2,8× wolniejszy od CUDA (2,095 s).
 
 ## Neural Engine Apple Silicon przez Core ML
 
@@ -247,8 +386,10 @@ wyników oraz accuracy; nie zawiera niestabilnych progów czasowych:
 .venv/bin/python benchmarks/compare_tinygrad_10_cases.py --json
 ```
 
-Na NVIDIA/CUDA użyj `--device cuda`; domyślny tryb `metal` zachowuje
-dotychczasowe zachowanie na Apple Silicon.
+Na NVIDIA/CUDA użyj `--device cuda`, dla OpenCL `--device opencl`, a dla Vulkan
+`--device vulkan`; domyślny tryb `metal` zachowuje dotychczasowe zachowanie na
+Apple Silicon. Flaga `--micro-only` pomija dwa długie przypadki treningowe.
+Opcja `--chomik-jit` przechwytuje oba treningi Chomika i obecnie wymaga OpenCL.
 
 Skrypt `benchmarks/transformer_vs_tinygrad.py` pozostaje krótszym benchmarkiem
 samego transformera.

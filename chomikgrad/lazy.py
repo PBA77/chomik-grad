@@ -195,6 +195,18 @@ class Compiler(ABC):
             )
         return None
 
+    def update_native_parameters(
+        self,
+        parameters: Sequence[LazyNode],
+        gradients: Sequence[object],
+        learning_rate: float,
+        *,
+        inplace: bool = False,
+    ) -> Tuple[Tuple[LazyNode, ...], Tuple[LazyNode, ...]]:
+        raise RuntimeError(
+            "this compiler does not support compiled training steps"
+        )
+
 
 def topological_sort(
     outputs: Iterable[LazyNode], *, use_lowerings: bool = False
